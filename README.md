@@ -399,22 +399,26 @@ bash tools/build.sh          # 产出 out/fnmusic_kugou_pro-<版本>.fpk
 
 ### 构建是**可复现**的
 
-同一份源码，**在任何机器、任何 umask 下**打包，`.fpk` 的 MD5 都应当一致。
-你可以自己验证：
+同一份源码，**在任何机器、任何 umask、任何时区下**打包，`.fpk` 与 `-src.zip`
+的哈希都应当一致。你可以自己验证：
 
 ```bash
-bash tools/build.sh && md5sum out/fnmusic_kugou_pro-*.fpk
-# 换个 umask 再来一次，两次哈希必须相同
-(umask 077 && bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-*.fpk
+bash tools/build.sh && md5sum out/fnmusic_kugou_pro-1.0.0/*.fpk out/fnmusic_kugou_pro-1.0.0/*-src.zip
+# 换个 umask / 换个时区再来一次，两次哈希必须相同
+(umask 077 && TZ=UTC bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-1.0.0/*.fpk out/fnmusic_kugou_pro-1.0.0/*-src.zip
 ```
 
-为此构建脚本钉死了**三样**东西，缺一样就会漂移（都是真实踩过的坑）：
+产物会组装在 `out/fnmusic_kugou_pro-1.0.0/`，含 `checksums.txt`
+（发帖用）与 `SHA256SUMS` / `MD5SUMS`（机器校验用，`sha256sum -c SHA256SUMS`）。
 
-| # | 漂移来源 | 处理 |
-|---|---|---|
-| ① | tar 写入构建机的 `uname`/`gname`、`uid`/`gid` | `--owner=0 --group=0 --numeric-owner` |
-| ② | 每个成员各自的 `mtime` | `--mtime=@<固定 EPOCH>`（覆盖所有成员） |
-| ③ | **每个成员的权限位**（来自构建时 umask） | 过一层暂存目录，归一为 目录 755 / 文件 644 / 脚本 755 |
+为此构建脚本钉死了**四样**东西，缺一样就会漂移（都是真实踩过的坑）：
+
+| # | 漂移来源 | 载体 | 处理 |
+|---|---|---|---|
+| ① | 构建机的 `uname`/`gname`、`uid`/`gid` | `tar` 元数据 | `--owner=0 --group=0 --numeric-owner` |
+| ② | 每个成员各自的 `mtime` | `tar` 元数据 | `--mtime=@<固定 EPOCH>`（覆盖所有成员） |
+| ③ | **每个成员的权限位**（来自构建时 umask） | `tar` 元数据 | 过一层暂存目录，归一为 目录 755 / 文件 644 / 脚本 755 |
+| ④ | **构建机的时区** | **zip 头 DOS 时间** | 源码包改用 `tools/make_src_zip.py` 确定性重打包 |
 
 另外 `.pyc` 用 `compileall --invalidation-mode checked-hash` 编译，
 使其只依赖源码**内容哈希**（不是 mtime），从而跨文件修改时间稳定。
@@ -426,12 +430,20 @@ bash tools/build.sh && md5sum out/fnmusic_kugou_pro-*.fpk
 > —— **在这里"权限收紧"是隐性故障，不是更安全。**
 > 已固化为 `tests/test_package_hygiene.py` 第 `[8]` 节（含 `go+w` 检查）。
 
+> **⚠️ 第 ④ 条只影响源码包。** `git archive --format=zip` 会把 commit 时间
+> **转成本地时区**写进 zip 头，于是同一个 commit 在不同 `TZ` 下哈希不同
+> （实测四时区四个值），异地贡献者**无法复现**我们公布的源码包哈希 ——
+> 甚至可能误以为包被动过手脚。`.fpk` 内层是 `tar`，写的是 unix epoch，
+> **不受时区影响**，所以这一层**只影响 `-src.zip`**。
+> 现在源码包由 `tools/make_src_zip.py` 生成（`tar` 当中间格式 → 固定时间戳
+> 重打包为 zip），四时区同哈希。已固化为 `tests/test_src_zip_reproducible.py`。
+
 > **❌ 别用 `tar --mode` 替代暂存目录**：它是单一 flag，无法对同一归档里的
 > 不同文件用不同 mode；而 `+X` 是**粘性**语义，源文件是 `600` 时**不会**提权
 > ⇒ 恰好丢掉 `run_proxy.sh` 的可执行位。
 
 **打包顺序不能变**：先清杂 → 打 `app.tgz` → 回填 `manifest.checksum`
-（飞牛用 **MD5**）→ 打外层 `.fpk`。
+（飞牛用 **MD5**）→ 打外层 `.fpk` → 生成 `src.zip` → 组装交付目录 `out/<app>-<ver>/`。
 
 > ⚠️ **绝不能把 `.env` 打进包**：飞牛覆盖安装是**先解包、后跑 callback**，
 > 包里若是带了一份 `.env`（哪怕空模板），它会在 callback 有机会迁移之前

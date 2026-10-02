@@ -502,6 +502,49 @@ auth_len=88                    ← 只有 token + userid，其余字段为空
 
 ---
 
+### Q31. 我自己重新打包，得到的哈希和发布的不一样？
+
+先确认你跑的是**交付的构建脚本**，而不是"我理解了一遍、手敲了等价命令"：
+
+```bash
+bash tools/build.sh          # ✅ 必须跑这个
+```
+
+`tools/build.sh` 已经把全部确定的因素钉死了 —— 构建机身份、文件时间、
+权限位、时区。判据是"包必须与构建机无关"，所以**任何一项都不能绕过**。
+
+四条常见原因（按被踩到的频率排序）：
+
+| # | 原因 | 现象 | 处理 |
+|---|---|---|---|
+| ① | **手写了等价的 `tar` 命令**，漏掉权限归一那一步 | 哈希随 `umask` 变 | 跑 `tools/build.sh`，别手敲 |
+| ② | 文件权限受 `umask` 影响 | `umask 077` 与 `022` 打出不同包 | 同上；脚本内部过了暂存目录归一 |
+| ③ | **时区不同**（只影响 `-src.zip`） | 四个时区四个哈希 | 源码包用 `tools/make_src_zip.py` 生成 |
+| ④ | 用了 Python **3.11** 而不是 3.12 编 pyc | 包内多出 311 字节码 | 脚本找不到 3.12 会**直接退出**，不将就 |
+
+> ⚠️ **"我在同一台机器上连跑三次都一样"不构成证据** —— 三次都在同一个
+> `umask`、同一个时区下，任何漂移都被掩盖了。**验证可复现必须换环境**：
+>
+> ```bash
+> for um in 077 022 002; do
+>   (umask $um && TZ=UTC bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-1.0.0/*.fpk
+> done    # 三次必须相同
+> ```
+
+`.fpk` 对**时区**免疫（内层是 `tar`，写 unix epoch）；**时区只影响 `-src.zip`**。
+
+自查也可以直接跑仓库里现成的测试：
+
+```bash
+env -u PYTHONPATH python3 tests/test_package_hygiene.py out/fnmusic_kugou_pro-1.0.0/fnmusic_kugou_pro-1.0.0.fpk
+env -u PYTHONPATH python3 tests/test_src_zip_reproducible.py
+```
+
+> 💡 `env -u PYTHONPATH` 不是可选项：部分环境会给子进程注入全局
+> `PYTHONPATH`，它会**盖过 venv 装的包**，制造一堆假的 `ModuleNotFoundError`。
+
+---
+
 ## 别的问题？
 
 先看 [README](README.md) 的「已知限制」章节 —— 有些"问题"其实是我们已经

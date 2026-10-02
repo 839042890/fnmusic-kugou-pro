@@ -54,8 +54,8 @@ echo "▸ version : $VERSION"
 #
 # 两个泄漏源，必须同时堵：
 #   ① tar 会把构建机的 uname/gname/uid/gid 和**每个文件各自的 mtime** 写进归档。
-#      实测旧包外层泄漏 ('octop-native','AppUsers',930,924)、
-#      内层泄漏 ('octop-native','octop-native',930,924)。
+#      实测旧包外层与内层都带过构建机的真实用户名/组名与 uid/gid
+#      （形如 ('<用户名>','<组名>',<uid>,<gid>)）。
 #   ② pyc 默认是**时间戳型**（flags=0），把源文件 mtime 编进字节码 ——
 #      即使 tar 修好了，源码 mtime 一变 pyc 就变，包还是不稳定。
 #
@@ -248,14 +248,146 @@ assert_modes app.tgz '\./proxy/run_proxy\.sh$'
 assert_modes "$FPK" '^cmd/'
 echo "▸ fpk     : 权限已归一"
 
-# --- 5) 包卫生自检 ---------------------------------------------------------
+# --- 5) 源码包 src.zip（跨时区可复现）--------------------------------------
+# 为什么不用 `git archive --format=zip`：它把 commit 时间**转成"本地时区"**的
+# DOS 时间写进 zip 头，于是同一个 commit 在不同 TZ 下打出的 zip 哈希不同
+# （实测四时区四个值）。差异 280 字节、全在 zip 头的时间字段，
+# 但足以让我们公布的哈希**在异地无法复现** —— 别人会误以为包被改过。
+#
+# tar 格式不受影响（写 unix epoch），所以用 tar 当中间格式，
+# 再由 tools/make_src_zip.py 确定性地重打包为 zip。
+#
+# ⚠ src.zip 必须**最后**生成：它归档的是 git HEAD 的**已提交**内容，
+#   而本脚本会改写 manifest.checksum / app.tgz。所以发布流程是
+#   ① 跑 build.sh  → ② git add -A && git commit  → ③ 再跑一次 build.sh
+#   让 src.zip 覆盖成"包含最新 commit"的那份（.fpk 的哈希不受影响）。
+SRCZIP="out/fnmusic_kugou_pro-${VERSION}-src.zip"
+if [[ -d .git ]]; then
+    env -u PYTHONPATH "$PY312" tools/make_src_zip.py . "$SRCZIP" \
+        "${APP_NAME}-${VERSION}/"
+    # 硬判据：同一份源码**重新生成**，换 TZ 必须同哈希。
+    #
+    # ⚠ 这里有个极易写错的陷阱，差点让我白测一场：
+    #   对**同一个已存在的文件**跑 `TZ=X md5sum f` 是毫无意义的 ——
+    #   md5sum 不读时区，三次必然相同，断言恒真（测试永远绿，什么也没验）。
+    #   必须**在各自 TZ 下重新生成一次**，再比哈希。
+    #   工具不同（bash 的 TZ 只影响子进程）也要留意：每个生成都在
+    #   `TZ=... python3 ...` 里跑，才是真的换环境。
+    _tz_zip_md5() {   # $1=TZ，$2=输出路径；回显该 TZ 下新生成 zip 的 md5
+        env -u PYTHONPATH TZ="$1" "$PY312" tools/make_src_zip.py . "$2" \
+            "${APP_NAME}-${VERSION}/" >/dev/null || return 1
+        md5sum "$2" | cut -d' ' -f1
+    }
+    _t="$(mktemp -d)"
+    _h1="$(_tz_zip_md5 UTC            "$_t/utc.zip")"       || { echo "❌ TZ=UTC 下生成失败"; exit 1; }
+    _h2="$(_tz_zip_md5 Asia/Shanghai  "$_t/sha.zip")"       || { echo "❌ TZ=Asia/Shanghai 下生成失败"; exit 1; }
+    _h3="$(_tz_zip_md5 America/New_York "$_t/ny.zip")"      || { echo "❌ TZ=America/New_York 下生成失败"; exit 1; }
+    _h4="$(_tz_zip_md5 Pacific/Kiritimati "$_t/kir.zip")"   || { echo "❌ TZ=Pacific/Kiritimati 下生成失败"; exit 1; }
+    # 与"实际要交付的那份"也必须一致，否则说明交付物与已验证物不是同一个东西
+    _h5="$(md5sum "$SRCZIP" | cut -d' ' -f1)"
+    rm -rf "$_t"
+    if [[ "$_h1" != "$_h2" || "$_h2" != "$_h3" || "$_h3" != "$_h4" ]]; then
+        echo "❌ src.zip 跨时区不可复现：" >&2
+        printf '     UTC=%s\n     SH=%s\n     NY=%s\n     KIR=%s\n' "$_h1" "$_h2" "$_h3" "$_h4" >&2
+        exit 1
+    fi
+    [[ "$_h5" == "$_h1" ]] || { echo "❌ 交付的 src.zip 与跨 TZ 验证结果不一致"; exit 1; }
+    echo "▸ src.zip : $SRCZIP ($(stat -c%s "$SRCZIP") 字节, md5 $_h1)"
+    echo "            跨时区已验（UTC/SH/NY/Kiritimati 四时区同哈希）"
+else
+    echo "▸ src.zip : 跳过（无 .git，通常是从源码 zip 解包的场景）"
+    SRCZIP=""
+fi
+
+# --- 6) 组装交付目录 out/<app>-<ver>/ ---------------------------------------
+# 用户的原话是"我一次性拿走，填上 GitHub/Gitee 链接和下载地址就发布"。
+# 所以这里直接组装出**一个可以整体复制的目录**，而不是把文件散在工作区各处
+# —— 散着放就会出现"你以为复制全了、其实漏了 checksums.txt"这类事故。
+DIST="out/${APP_NAME}-${VERSION}"
+rm -rf "$DIST"
+mkdir -p "$DIST"
+cp "$FPK" "$DIST"/
+[[ -n "$SRCZIP" && -f "$SRCZIP" ]] && cp "$SRCZIP" "$DIST"/
+for f in README.md CHANGELOG.md FAQ.md SECURITY.md; do
+    [[ -f "$f" ]] && cp "$f" "$DIST"/
+done
+
+# 校验清单：在交付目录里、按**相对该目录**的文件名生成，
+# 这样用户 `cd` 进去直接 `sha256sum -c` 就能用，不会因为路径前缀对不上而报错。
+(
+    cd "$DIST"
+    PUBLISH=("$(basename "$FPK")")
+    [[ -n "$SRCZIP" && -f "$(basename "$SRCZIP")" ]] && PUBLISH+=("$(basename "$SRCZIP")")
+    for f in README.md CHANGELOG.md FAQ.md SECURITY.md; do
+        [[ -f "$f" ]] && PUBLISH+=("$f")
+    done
+
+    # 标准机器校验格式：只含**一种**算法长度的行。
+    # 为什么不把两种算法写进同一个文件再 `-c`：
+    #   `sha256sum -c` 遇到同文件里的 md5 行（32 位十六进制）会报
+    #   "improperly formatted"（退出码仍 0，但输出有噪音，容易被误读成失败）。
+    #   拆开之后两个命令都是干净的 0 退出。
+    : > SHA256SUMS
+    : > MD5SUMS
+    for f in "${PUBLISH[@]}"; do
+        printf "%s  %s\n" "$(sha256sum "$f" | cut -d' ' -f1)" "$f" >> SHA256SUMS
+        printf "%s  %s\n" "$(md5sum "$f" | cut -d' ' -f1)" "$f" >> MD5SUMS
+    done
+
+    {
+        echo "# fnmusic_kugou_pro ${VERSION} 发布校验和"
+        echo "# 生成：tools/build.sh（可复现构建）"
+        echo "# 用途：发帖 / 发 Release 时公示。"
+        echo "#"
+        echo "# 机器校验请用同目录的 SHA256SUMS / MD5SUMS（拆分是为了让输出干净）："
+        echo "#   sha256sum -c SHA256SUMS"
+        echo "#   md5sum    -c MD5SUMS"
+        echo "#"
+        echo "# 覆盖范围：本目录内的全部对外发布物。"
+        echo "# .fpk 的权威校验值另有出处：包内 manifest.checksum = app.tgz 的 md5。"
+        echo "# -src.zip 已消除时区依赖：同一 commit 在任何 TZ 下哈希相同。"
+        echo
+        echo "== SHA256 =="
+        cat SHA256SUMS
+        echo
+        echo "== MD5 =="
+        cat MD5SUMS
+    } > checksums.txt
+
+    # 自检：条目数对得上 + 引用的文件都在（防循环静默漏项）
+    [[ "$(wc -l < SHA256SUMS)" -eq "${#PUBLISH[@]}" ]] \
+        || { echo "❌ SHA256SUMS 条目数不符（$(wc -l < SHA256SUMS) != ${#PUBLISH[@]}）"; exit 1; }
+    [[ "$(wc -l < MD5SUMS)" -eq "${#PUBLISH[@]}" ]] \
+        || { echo "❌ MD5SUMS 条目数不符"; exit 1; }
+    while read -r _sum _file; do
+        [[ -z "$_sum" ]] && continue
+        [[ -f "$_file" ]] || { echo "❌ 校验清单引用了不存在的文件：$_file"; exit 1; }
+    done < SHA256SUMS
+    # 真跑一遍校验命令，确认它们是**干净的 0 退出**（不是"看起来对"）
+    sha256sum -c --status SHA256SUMS || { echo "❌ sha256sum -c SHA256SUMS 未通过"; exit 1; }
+    md5sum    -c --status MD5SUMS    || { echo "❌ md5sum -c MD5SUMS 未通过"; exit 1; }
+)
+DIST_N="$(find "$DIST" -maxdepth 1 -type f | wc -l)"
+
+# 权限归一：**必须显式 chmod**。
+# 本平台（飞牛 /vol1，btrfs + trimacl）上，新建文件的权限**等于父目录权限**，
+# umask 不参与决策 —— 父目录是 700，新文件就是 700，直接交付会让人取不走。
+# 目标形态：目录 755 / 文件 644（与包内归一化规则一致）。
+chmod 755 "$DIST"
+find "$DIST" -maxdepth 1 -type f -exec chmod 644 {} +
+echo "▸ 交付目录: $DIST（$DIST_N 个文件，权限 755/644，-c 自检通过）"
+
+# --- 7) 包卫生自检 ---------------------------------------------------------
 # 复用仓库自带的测试，避免"脚本说没问题、测试说有问题"两边打架。
 env -u PYTHONPATH "$PY312" tests/test_package_hygiene.py "$FPK" | tail -20
 
 echo
 echo "✅ 打包完成：$FPK"
-echo "   md5: $(md5sum "$FPK" | cut -d' ' -f1)"
+echo "   fpk md5    : $(md5sum "$FPK" | cut -d' ' -f1)"
+[[ -n "$SRCZIP" && -f "$SRCZIP" ]] && echo "   src.zip md5: $(md5sum "$SRCZIP" | cut -d' ' -f1)"
+echo "   交付目录   : $DIST"
 echo
-echo "下一步（建议）："
-echo "  1) 对**解包后的载荷**跑全套 tests/（不是工作树）"
-echo "  2) 交付：把 $FPK 复制到你的共享目录并 chmod 644"
+echo "下一步："
+echo "  1) 发布前对**解包后的载荷**跑全套 tests/（不是工作树）"
+echo "  2) 交付：把整个 $DIST/ 目录复制过去即可（含 checksums.txt）"
+echo "     复制后 chmod 644，或直接 rm -f 旧版本对应文件"

@@ -9,6 +9,13 @@ app.tgz
 build/
 dist/
 
+# 发布清单：build.sh 的产物，**不能入库**。
+# 若它进了 git，就会被 src.zip 自己打包进去 —— 而它里面要写 src.zip 的
+# 哈希，等于"文件包含自身的哈希"，永远无法收敛（先有鸡还是先有蛋）。
+checksums.txt
+SHA256SUMS
+MD5SUMS
+
 # ---- Python 字节码 ----
 __pycache__/
 *.py[cod]
