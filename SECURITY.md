@@ -16,6 +16,13 @@
 | GitHub 私有漏洞上报 | 本仓库 **Security → Report a vulnerability** | 首选，全程私密、可附文件 |
 | GitHub issue（仅限"想私下联系但我没开私有上报"的情形） | 新建 issue，**标题只写 `想私下报告安全问题，请提供联系方式`，正文不要写任何细节** | 兜底。我会尽快给你一个私下渠道 |
 
+> ⚠️ **维护者注意**：GitHub 的私有漏洞上报（Private vulnerability reporting）
+> **默认是关闭的**，仓库建好后必须手动去
+> `Settings → Code security → Private vulnerability reporting` 打开。
+> 没开的话，"Security" 标签下不会出现 *Report a vulnerability* 按钮，
+> 上表首选的渠道就是**不存在的**（报告者只能看到第二个兜底渠道）。
+> 所以本仓库发布后请确认该开关已启用，否则本文件的承诺落空。
+
 > 若上面两条都走不通，可以先用 issue 留一句"想报告安全问题"（**不含技术细节**），
 > 我们会开一个私下渠道继续。
 

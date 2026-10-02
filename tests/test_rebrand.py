@@ -14,9 +14,18 @@
 
 import os
 import re
+import subprocess
 import sys
 import struct
 from pathlib import Path
+
+# 校验 pyc 必须用**目标机运行时**（3.12）。本测试可能在 3.11 的 venv 里跑，
+# 而 3.11 连 3.12 的 pyc 都读不了；source_hash 算法跨版本是一致的，
+# 但为了稳妥仍优先用 3.12 算。
+_TARGET_PY = next(
+    (c for c in ("/var/apps/python312/target/bin/python3.12",) if Path(c).is_file()),
+    "",
+)
 
 # ---- 扫描根：默认本文件所在工程的 app/ 对应关系 -------------------------
 # 工程布局： <root>/app/**  ->  app.tgz 内 ./**      （tar czf app.tgz -C app .）
@@ -182,12 +191,33 @@ if pycache.is_dir():
         src = APP / "proxy" / f"{m.group(1)}.py"
         if not src.exists():
             continue
-        with open(p, "rb") as f:
-            f.read(8)
-            _mtime, size = struct.unpack("<II", f.read(8))
-        if size != src.stat().st_size:
-            stale.append(f"{p.name}(记录{size}≠实际{src.stat().st_size})")
-    check("无陈旧 .pyc（头记录 size == 源码 size）", not stale, "; ".join(stale))
+        # ⚠ pyc 头的后 8 字节含义**取决于失效模式（flags 低 2 位）**：
+        #   0 timestamp → mtime(4) + 源大小(4)
+        #   1/3 hash    → 源哈希(8)，**没有源大小字段**
+        # 打包用的是 checked-hash（为了可复现，见 build.sh），
+        # 所以老式"读 size 比大小"的判据必须换成"比哈希"。
+        # 这里用 3.12 自己算 importlib.util.source_hash 来比对 ——
+        # 不用 sha256，那个算法对不上（实测过）。
+        raw = p.read_bytes()
+        flags = struct.unpack("<I", raw[4:8])[0]
+        mode = flags & 0x03
+        if mode == 0:
+            _mtime, size = struct.unpack("<II", raw[8:16])
+            if size != src.stat().st_size:
+                stale.append(f"{p.name}(记录{size}≠实际{src.stat().st_size})")
+        else:
+            stored = raw[8:16].hex()
+            r = subprocess.run(
+                [_TARGET_PY or sys.executable, "-c",
+                 "import importlib.util,sys,pathlib;"
+                 "print(importlib.util.source_hash(pathlib.Path(sys.argv[1]).read_bytes()).hex())",
+                 str(src)],
+                capture_output=True, text=True,
+            )
+            want = r.stdout.strip()
+            if not want or stored != want:
+                stale.append(f"{p.name}(哈希{stored}≠源码{want or '未算出'})")
+    check("无陈旧 .pyc（pyc 记录的源指纹 == 当前源码）", not stale, "; ".join(stale))
     # 断言 pyc 里残留的旧名**不超过**其源码。
     # 为什么这样判：
     #   · .pyc 会内联 docstring 与字符串字面量（但不含注释），所以

@@ -113,10 +113,19 @@ check("48MB 归档修复的代码仍在（内存缓存不再是唯一字节来�
 check("transcode 取证日志的代码仍在", "transcode" in _app_src.lower())
 
 print()
-print("[5] pyc 与源码一致性（magic/size/mtime）")
+print("[5] pyc 与源码一致性（magic / 失效模式）")
+# 失效模式（flags 低 2 位）决定 pyc 头里那 8 个字节是什么：
+#   0 timestamp       → 头 = mtime(4) + 源大小(4)
+#   1 unchecked-hash  → 头 = 源哈希(8)，运行时**不校验**
+#   3 checked-hash    → 头 = 源哈希(8)，运行时校验（源码变了就重编）
+# 我们打的是 checked-hash：它是唯一既能"跨 mtime 可复现"、又保留
+# "源码改了 pyc 会失效"保护的选项。所以断言必须跟着分支走 ——
+# 早先写死"pyc 记录的 mtime == 实际"，换成哈希模式后必然全红（实测 6 条失败）。
 import struct
 import shutil
 import subprocess
+
+MODE_TIMESTAMP, MODE_UNCHECKED, MODE_CHECKED = 0, 1, 3
 
 
 def _find_target_py() -> str:
@@ -177,12 +186,37 @@ for src_name in ("app.py", "app_socket_bridge.py", "kugou_source.py"):
         check(f"{src_name}: 源码/pyc 都在", False, f"{src.is_file()}/{pyc.is_file()}")
         continue
     raw = pyc.read_bytes()
-    magic, flags, mtime, size = struct.unpack("<4sIII", raw[:16])
+    magic, flags, f1, f2 = struct.unpack("<4sIII", raw[:16])
+    mode = flags & 0x03
     st = src.stat()
-    check(f"{src_name}: pyc 记录的源大小 == 实际（{size}）", size == st.st_size,
-          f"pyc={size} 实际={st.st_size}")
-    check(f"{src_name}: pyc 记录的 mtime == 实际", mtime == int(st.st_mtime),
-          f"pyc={mtime} 实际={int(st.st_mtime)}")
+    check(f"{src_name}: pyc 不是 unchecked-hash（不校验的模式不许进包）",
+          mode != MODE_UNCHECKED, f"flags={flags} mode={mode}")
+    if mode == MODE_TIMESTAMP:
+        # 老式时间戳型：头里是 mtime + 源大小
+        size, mtime = f2, f1
+        check(f"{src_name}: pyc 记录的源大小 == 实际（{size}）", size == st.st_size,
+              f"pyc={size} 实际={st.st_size}")
+        check(f"{src_name}: pyc 记录的 mtime == 实际", mtime == int(st.st_mtime),
+              f"pyc={mtime} 实际={int(st.st_mtime)}")
+    else:
+        # 哈希型：头里 8 字节是源文件哈希。
+        # ⚠ 用的是 importlib.util.source_hash()，**不是** sha256/djb2 那类
+        #   常见摘要 —— 按 sha256 写的断言会稳定失败。必须让 3.12 自己算。
+        want = b""
+        if _TARGET_PY:
+            r = subprocess.run(
+                [_TARGET_PY, "-c",
+                 "import importlib.util,sys,pathlib;"
+                 "print(importlib.util.source_hash(pathlib.Path(sys.argv[1]).read_bytes()).hex())",
+                 str(src)],
+                capture_output=True, text=True,
+            )
+            want = r.stdout.strip()
+        stored = raw[8:16].hex()
+        check(f"{src_name}: pyc 源哈希 == importlib.util.source_hash（{stored}）",
+              bool(want) and stored == want, f"pyc={stored} 期望={want or '未算出'}")
+        check(f"{src_name}: 哈希模式下 mtime 字段不参与（可复现性来源）",
+              mode == MODE_CHECKED, f"mode={mode}")
     if TARGET_MAGIC:
         check(f"{src_name}: pyc magic 匹配目标 3.12（{magic.hex()}）",
               magic == TARGET_MAGIC, f"pyc={magic.hex()} 目标={TARGET_MAGIC.hex()}")
@@ -273,6 +307,47 @@ for n, blob in top_icons.items():
 check("顶层 ICON*.PNG 为正方形且带 alpha", not _bad_top, str(_bad_top))
 _i256 = _png_size(top_icons.get("ICON_256.PNG", b""))
 check("ICON_256.PNG 就是 256x256", _i256 is not None and _i256[:2] == (256, 256), str(_i256))
+
+print()
+print("[7] tar 元数据：不许泄漏构建机身份（用户名/组名/uid/gid）")
+# 为什么单列一组：tar 默认把**构建机**的 uname/gname 和 uid/gid 写进归档。
+# 实测旧交付包外层泄漏 ('octop-native','AppUsers',930,924)、
+# 内层泄漏 ('octop-native','octop-native',930,924) —— 用户解包就能看到
+# 打包者的用户名和用户 ID。这不只是隐私问题，也是**可复现性**问题：
+# 换台机器（或换个账号）打包，同一份源码会得到不同字节。
+#
+# 修法是打包时 --owner=0 --group=0 --numeric-owner，让 tar 只写 uid/gid=0
+# 且不写名字。这里断言结果，不关心脚本怎么实现。
+
+def _tar_identity_labels(tf):
+    """返回 (名字泄漏列表, 非零uid/gid列表, mtime集合)。"""
+    leaked, bad_ids, mtimes = [], [], set()
+    for ti in tf.getmembers():
+        if ti.uname or ti.gname:
+            leaked.append(f"{ti.name}: uname={ti.uname!r} gname={ti.gname!r}")
+        if ti.uid != 0 or ti.gid != 0:
+            bad_ids.append(f"{ti.name}: uid={ti.uid} gid={ti.gid}")
+        mtimes.add(ti.mtime)
+    return leaked, bad_ids, mtimes
+
+
+with tarfile.open(FPK) as tf:
+    out_leak, out_ids, out_mtimes = _tar_identity_labels(tf)
+with tarfile.open(inner) as itf:
+    inn_leak, inn_ids, inn_mtimes = _tar_identity_labels(itf)
+
+check("外层 .fpk 不含构建机用户名/组名", not out_leak, str(out_leak[:3]))
+check("外层 .fpk 的 uid/gid 全为 0", not out_ids, str(out_ids[:3]))
+check("内层 app.tgz 不含构建机用户名/组名", not inn_leak, str(inn_leak[:3]))
+check("内层 app.tgz 的 uid/gid 全为 0", not inn_ids, str(inn_ids[:3]))
+
+# mtime 必须钉成同一个值，否则"文件修改时间不同 → 归档字节不同"。
+# EPOCH 与 build.sh 里保持一致；这里只断言"唯一"，不锁死具体数值，
+# 这样 build.sh 换 EPOCH 不需要同步改测试。
+check("外层 .fpk 所有成员 mtime 唯一（打包时刻不泄漏）",
+      len(out_mtimes) == 1, f"{sorted(out_mtimes)[:4]}…共{len(out_mtimes)}种")
+check("内层 app.tgz 所有成员 mtime 唯一（源 mtime 不泄漏）",
+      len(inn_mtimes) == 1, f"{sorted(inn_mtimes)[:4]}…共{len(inn_mtimes)}种")
 
 print()
 print("=" * 70)
