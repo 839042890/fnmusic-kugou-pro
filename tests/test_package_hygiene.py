@@ -350,6 +350,81 @@ check("内层 app.tgz 所有成员 mtime 唯一（源 mtime 不泄漏）",
       len(inn_mtimes) == 1, f"{sorted(inn_mtimes)[:4]}…共{len(inn_mtimes)}种")
 
 print()
+print("[8] 权限位：不许泄漏构建机 umask（否则跨机器不可复现）")
+# 为什么单列一组：tar 还会把**每个成员的 mode** 原样写进归档，而 mode 来自磁盘、
+# 磁盘 mode 来自打包时的 umask。1.0.0 收尾时实测到：同一份源码用 umask 077 与
+# umask 022 打包，MD5 **不同**——当时"连跑 3 次一致"只证明了同机稳定。
+#
+# 两个实际后果（不是"哈希不好看"而已）：
+#   · manifest / LICENSE / cmd/* / wizard/* 会带上构建机 umask 痕迹（本机是 700），
+#     任何人 `tar tvf` 就能看到；
+#   · umask 077 的机器打出的包，cmd/* 是 700（上游发布的是 755），
+#     而 cmd/main 有 `[ ! -x "$APP_DIR/proxy/run_proxy.sh" ]` 硬检查，
+#     非 root 场景会判成"找不到 run_proxy.sh"。**权限收紧在这里是隐性故障。**
+#
+# 修法是打包前过一层暂存目录把权限归一：目录 755 / 文件 644 /
+# 仅 cmd/* 与 app/proxy/run_proxy.sh 置 755。这里断言结果，不关心实现。
+#
+# 反向对照（必须做，否则不知道断言在不在工作）：拿 umask 077 打出的旧包跑，
+# 本节应报 FAIL（cmd/* 为 700）。
+
+def _mode_of(tf, name):
+    for ti in tf.getmembers():
+        if ti.name == name or ti.name.lstrip("./") == name.lstrip("./"):
+            return ti
+    return None
+
+
+def _mode_audit(tf, script_names):
+    """返回 (问题列表, 出现过的 mode 集合)。
+
+    script_names: 允许/要求为 755 的成员名集合（其余文件必须是 644）。
+    """
+    problems, modes = [], set()
+    for ti in tf.getmembers():
+        m = ti.mode & 0o7777
+        modes.add(m)
+        nm = ti.name
+        if ti.isdir():
+            if m != 0o755:
+                problems.append(f"目录 mode={m:04o}（应 755）: {nm}")
+        elif nm in script_names:
+            if m != 0o755:
+                problems.append(f"脚本 mode={m:04o}（应 755）: {nm}")
+        else:
+            if m != 0o644:
+                problems.append(f"文件 mode={m:04o}（应 644）: {nm}")
+        if m & 0o022:
+            problems.append(f"出现 go+w（组/其他人可写）mode={m:04o}: {nm}")
+    return problems, modes
+
+
+_out_scripts = set()
+with tarfile.open(FPK) as _tf:
+    for _ti in _tf.getmembers():
+        if _ti.isfile() and _ti.name.lstrip("./").startswith("cmd/"):
+            _out_scripts.add(_ti.name)
+    _out_probs, _out_modes = _mode_audit(_tf, _out_scripts)
+check("外层 .fpk 权限已归一（目录 755 / 文件 644 / cmd/* 755）",
+      not _out_probs, str(_out_probs[:4]))
+check("外层 .fpk 无 go+w（组/其他人可写）",
+      not any("go+w" in p for p in _out_probs), str(_out_probs[:4]))
+
+with tarfile.open(inner) as _itf:
+    _inn_probs, _inn_modes = _mode_audit(
+        _itf, {"./proxy/run_proxy.sh", "proxy/run_proxy.sh"})
+    # run_proxy.sh 必须真的可执行 —— cmd/main 会 -x 检查它，丢了就起不来。
+    _rp = _mode_of(_itf, "proxy/run_proxy.sh") or _mode_of(_itf, "./proxy/run_proxy.sh")
+check("内层 app.tgz 权限已归一（目录 755 / 文件 644 / run_proxy.sh 755）",
+      not _inn_probs, str(_inn_probs[:4]))
+check("内层 app.tgz 的 run_proxy.sh 保留可执行位",
+      _rp is not None and (_rp.mode & 0o111) == 0o111,
+      f"存在={_rp is not None} mode={_rp.mode:04o}" if _rp else "未找到 run_proxy.sh")
+# 反向守卫：确认"权限集合"真的收敛了（若断言写错、mode 五花八门，这里会暴露）
+check(f"外层 .fpk 只出现 0644/0755 两种 mode（实测 {sorted(f'{m:04o}' for m in _out_modes)}）",
+      _out_modes <= {0o644, 0o755}, str(sorted(f"{m:04o}" for m in _out_modes)))
+
+print()
 print("=" * 70)
 print(f"结果：{len(PASS)} 通过 / {len(FAIL)} 失败")
 print("=" * 70)

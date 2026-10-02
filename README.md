@@ -397,6 +397,39 @@ bash tools/build.sh          # 产出 out/fnmusic_kugou_pro-<版本>.fpk
 > 上游仓库里也有一份 `build-fpk.sh`，可作参考；本项目的脚本
 > 在其思路上补齐了 `.pyc` 重编与发布前自检。
 
+### 构建是**可复现**的
+
+同一份源码，**在任何机器、任何 umask 下**打包，`.fpk` 的 MD5 都应当一致。
+你可以自己验证：
+
+```bash
+bash tools/build.sh && md5sum out/fnmusic_kugou_pro-*.fpk
+# 换个 umask 再来一次，两次哈希必须相同
+(umask 077 && bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-*.fpk
+```
+
+为此构建脚本钉死了**三样**东西，缺一样就会漂移（都是真实踩过的坑）：
+
+| # | 漂移来源 | 处理 |
+|---|---|---|
+| ① | tar 写入构建机的 `uname`/`gname`、`uid`/`gid` | `--owner=0 --group=0 --numeric-owner` |
+| ② | 每个成员各自的 `mtime` | `--mtime=@<固定 EPOCH>`（覆盖所有成员） |
+| ③ | **每个成员的权限位**（来自构建时 umask） | 过一层暂存目录，归一为 目录 755 / 文件 644 / 脚本 755 |
+
+另外 `.pyc` 用 `compileall --invalidation-mode checked-hash` 编译，
+使其只依赖源码**内容哈希**（不是 mtime），从而跨文件修改时间稳定。
+
+> **⚠️ 第 ③ 条最容易漏。** 只做 ①② 时，"连跑 3 次 MD5 一致"看起来没问题，
+> 但那只是**同一台机器、同一个 umask** 下的稳定；换台机器就不同。
+> 而且 umask 077 的机器会把 `cmd/*` 打成 `700`（上游发布的是 `755`），
+> 非 root 场景会因 `cmd/main` 里的 `-x` 检查判成"找不到 `run_proxy.sh`"
+> —— **在这里"权限收紧"是隐性故障，不是更安全。**
+> 已固化为 `tests/test_package_hygiene.py` 第 `[8]` 节（含 `go+w` 检查）。
+
+> **❌ 别用 `tar --mode` 替代暂存目录**：它是单一 flag，无法对同一归档里的
+> 不同文件用不同 mode；而 `+X` 是**粘性**语义，源文件是 `600` 时**不会**提权
+> ⇒ 恰好丢掉 `run_proxy.sh` 的可执行位。
+
 **打包顺序不能变**：先清杂 → 打 `app.tgz` → 回填 `manifest.checksum`
 （飞牛用 **MD5**）→ 打外层 `.fpk`。
 
@@ -408,8 +441,9 @@ bash tools/build.sh          # 产出 out/fnmusic_kugou_pro-<版本>.fpk
 
 - 跑测试必须 `env -u PYTHONPATH` —— 宿主注入的 `PYTHONPATH` 会盖过
   venv 的包，制造 `ModuleNotFoundError` 之类**假故障**。
-- 改了 `.py` 一定要**重编 `.pyc`**（源 size / mtime 要对上），
-  否则 Python 加载旧字节码，让你误判"补丁没生效"。
+- 改了 `.py` 一定要**重编 `.pyc`**，否则 Python 加载旧字节码，
+  让你误判"补丁没生效"。本项目用 `checked-hash` 模式编译（见上），
+  所以校验依据是**源码内容哈希**而非 mtime —— 改了源码就会被发现。
 
 ---
 
@@ -419,6 +453,7 @@ bash tools/build.sh          # 产出 out/fnmusic_kugou_pro-<版本>.fpk
 fnmusic_kugou_pro/
 ├── LICENSE                  # GPL-2.0 全文
 ├── README.md / CHANGELOG.md / FAQ.md
+├── SECURITY.md              # 安全漏洞的报告渠道与处理时限
 ├── manifest                 # 应用元数据（含 checksum）
 ├── app/
 │   ├── proxy/               # 核心：代理服务、酷狗源、路由、归档
@@ -439,7 +474,9 @@ fnmusic_kugou_pro/
 - **Bug 反馈**请附：版本号、现象与复现步骤、
   `/vol1/@appcenter/fnmusic_kugou_pro/log/proxy.log`、上游地址与端口
   （不用给凭据）、是否关闭了官方 App 的转码开关
-- **安全漏洞**：请**不要**公开开 Issue，先私下联系维护者
+- **安全漏洞**：请**不要**公开开 Issue，先私下联系维护者。
+  具体渠道与处理时限见 **[SECURITY.md](SECURITY.md)**
+  （首选 GitHub 私有漏洞上报：本仓库 **Security → Report a vulnerability**）
 - **Pull Request**：请说明动机与验证方式；涉及行为变更请同步更新 CHANGELOG
 
 ---

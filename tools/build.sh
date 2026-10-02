@@ -66,6 +66,36 @@ TARFIX=(--sort=name --owner=0 --group=0 --numeric-owner --mtime="@${EPOCH}")
 # `--owner=0 --group=0 --numeric-owner` 则负责不写构建机的用户名与 uid/gid。
 # （早先版本额外做了一遍 `find app -exec touch`，实测在本机文件系统上
 #  `touch app.tgz` 会 "Operation not permitted"，且本来就多余 —— 已删。）
+#
+# ③ **权限位**（最容易漏的一格）：tar 会把每个成员的 mode 原样写进归档，
+#    而 mode 来自磁盘、磁盘 mode 来自构建时的 **umask**。
+#    ⇒ 同一份源码，umask 077 与 umask 022 打出的包 **MD5 不同**。
+#    这不是"哈希不好看"而已，有两个实际后果：
+#      · 包里 manifest / LICENSE / cmd/* / wizard/* 会带上构建机的 umask 痕迹
+#        （实测本机是 700），任何人 `tar tvf` 就能看到；
+#      · 若构建机 umask 是 077，`cmd/*` 会变成 700 —— 上游发布的是 755，
+#        而 `cmd/main` 里有硬检查 `[ ! -x "$APP_DIR/proxy/run_proxy.sh" ]`，
+#        非 root 场景会直接判成"找不到 run_proxy.sh"。
+#        **在这里"权限收紧"是隐性故障，不是更安全。**
+#    所以打包前先把载荷复制进**暂存目录**、把权限归一成确定值：
+#      目录 755 / 文件 644 / 仅 `cmd/*` 与 `app/proxy/run_proxy.sh` 置 755。
+#
+#    ❌ 别想着用 `tar --mode` 省掉暂存目录，两个坑都实测过：
+#       ① 它是**单一** flag，无法对同一归档里的不同文件用不同 mode
+#          （数据要 644、脚本要 755）；
+#       ② `+X` 是**粘性**语义（仅当已有某位可执行时才补 x），源文件是 600 时
+#          **不会**提权 ⇒ `run_proxy.sh` 丢掉可执行位 ⇒ 正好踩上面那个硬检查。
+STAGE_ROOT="$(mktemp -d)"
+trap 'rm -rf "$STAGE_ROOT"' EXIT
+
+# 把 <源目录> 的内容归一化权限后复制到 <目标目录>
+stage() {
+    local src="$1" dst="$2"
+    mkdir -p "$dst"
+    cp -a "$src/." "$dst/"
+    find "$dst" -type d -exec chmod 755 {} +
+    find "$dst" -type f -exec chmod 644 {} +
+}
 
 # --- 1) 清干净再编 pyc ------------------------------------------------------
 # compileall **只增不删**：目录里若有上次 3.11 留下的 pyc，会被一起打进包。
@@ -137,7 +167,13 @@ echo "▸ pyc     : $(echo "$PYCS" | wc -l) 个，全 312，无绝对路径"
 # 历史事故：升级后酷狗登录态丢失，表现为"突然搜不到歌"。
 rm -f app/.env
 [[ ! -e app/.env ]] || { echo "❌ app/.env 删不掉，中止"; exit 1; }
-tar czf app.tgz "${TARFIX[@]}" -C app .
+
+# 归一化权限后再打（见上面 ③ 的说明）。`run_proxy.sh` 是唯一需要可执行位的载荷文件
+# —— `cmd/main:26` 有 `[ ! -x "$APP_DIR/proxy/run_proxy.sh" ]` 的硬检查。
+STAGE_APP="$STAGE_ROOT/app"
+stage app "$STAGE_APP"
+chmod 755 "$STAGE_APP/proxy/run_proxy.sh"
+tar czf app.tgz "${TARFIX[@]}" -C "$STAGE_APP" .
 
 if tar tzf app.tgz | grep -qxE '\./\.env|\.env'; then
     echo "❌ app.tgz 里混进了 .env"; exit 1
@@ -159,16 +195,58 @@ echo "▸ checksum: $CHECK"
 # --- 4) 打 .fpk -------------------------------------------------------------
 # 顶层必须平铺：manifest / app.tgz / cmd / config / wizard / 图标 / LICENSE。
 # tests/ 不进包（那是开发用的，不是运行时要的东西）。
+#
+# 同样先过暂存层归一化权限：`cmd/*` 是飞牛的入口脚本，必须 755
+# （这是上游的发布形态，也是唯一不会因构建机 umask 而漂移的形态）。
+STAGE_FPK="$STAGE_ROOT/fpk"
+mkdir -p "$STAGE_FPK"
+cp -a manifest app.tgz cmd config wizard ICON.PNG ICON_256.PNG LICENSE "$STAGE_FPK"/
+find "$STAGE_FPK" -type d -exec chmod 755 {} +
+find "$STAGE_FPK" -type f -exec chmod 644 {} +
+chmod 755 "$STAGE_FPK"/cmd/*
 mkdir -p out
 FPK="out/fnmusic_kugou_pro-${VERSION}.fpk"
-tar czf "$FPK" "${TARFIX[@]}" manifest app.tgz cmd config wizard \
-    ICON.PNG ICON_256.PNG LICENSE
+tar czf "$FPK" "${TARFIX[@]}" -C "$STAGE_FPK" \
+    manifest app.tgz cmd config wizard ICON.PNG ICON_256.PNG LICENSE
 
 # 顶层不许出现多出来的目录树（飞牛按平铺结构解包）
 EXTRA=$(tar tzf "$FPK" | awk -F/ 'NF>1 && $2=="" {print $1}' | sort -u \
         | grep -vE '^(manifest|app\.tgz|cmd|config|wizard|ICON\.PNG|ICON_256\.PNG|LICENSE)$' || true)
 [[ -z "$EXTRA" ]] || { echo "❌ .fpk 顶层有多余条目：$EXTRA"; exit 1; }
 echo "▸ fpk     : $FPK ($(stat -c%s "$FPK") 字节)"
+
+# --- 4b) 权限位自查（umask 不得泄漏进包）-------------------------------------
+# 这一节是 1.0.0 发布收尾时补的：当时"连跑 3 次 MD5 一致"看着没问题，
+# 其实只证明了**同一台机器、同一个 umask** 下稳定；换个环境重打就不同。
+# 判据来自"包必须与构建机无关"，所以把权限写成**精确等值断言**，
+# 而不是"看起来还行"。
+assert_modes() {
+    local arch="$1" script_re="$2"
+    local bad="" mode name
+    while read -r mode name; do
+        if [[ "$name" == */ ]]; then                       # 目录：drwxr-xr-x
+            [[ "$mode" == "drwxr-xr-x" ]] || bad+="      目录非 755：$mode $name"$'\n'
+        elif [[ "$name" =~ $script_re ]]; then             # 脚本：-rwxr-xr-x
+            [[ "$mode" == "-rwxr-xr-x" ]] || bad+="      脚本非 755：$mode $name"$'\n'
+        else                                               # 其余：-rw-r--r--
+            [[ "$mode" == "-rw-r--r--" ]] || bad+="      文件非 644：$mode $name"$'\n'
+        fi
+    done < <(tar tzvf "$arch" | awk '{print $1, $NF}')
+    # 补一条独立判据：包内不得出现 go+w（组/其他人可写）。
+    # mode 串第 6 位 = group 的 w，第 9 位 = other 的 w。
+    local w
+    w=$(tar tzvf "$arch" | awk 'substr($1,6,1)=="w" || substr($1,9,1)=="w" {print "      " $1, $NF}')
+    [[ -z "$w" ]] || bad+="      存在 go+w（组/其他人可写）："$'\n'"$w"$'\n'
+    if [[ -n "$bad" ]]; then
+        echo "❌ $arch 权限位自查未通过（umask 可能泄漏）：" >&2
+        printf '%s' "$bad" >&2
+        exit 1
+    fi
+    echo "   $arch 权限位自查通过（目录 755 / 文件 644 / 脚本 755，无 go+w）"
+}
+assert_modes app.tgz '\./proxy/run_proxy\.sh$'
+assert_modes "$FPK" '^cmd/'
+echo "▸ fpk     : 权限已归一"
 
 # --- 5) 包卫生自检 ---------------------------------------------------------
 # 复用仓库自带的测试，避免"脚本说没问题、测试说有问题"两边打架。
