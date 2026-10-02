@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+# Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+# fnmusic-pro cmd/uninstall_callback
+# 卸载后清理 /tmp 状态
+rm -f /tmp/fnmusic-pro.pid /tmp/fnmusic-pro-appdest /tmp/fnmusic-pro-*.log 2>/dev/null
+exit 0

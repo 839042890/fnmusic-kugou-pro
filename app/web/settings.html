@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<!--
+SPDX-License-Identifier: GPL-2.0
+Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+
+本文件是自由软件：你可以按照 GNU 通用公共许可证（第 2 版）
+的条件重新发布和/或修改它。完整许可证见仓库根目录 LICENSE 文件。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞牛音乐酷狗增强</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f5f5;color:#333;padding:20px}
+.c{max-width:760px;margin:0 auto}
+.hdr{background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:24px;border-radius:12px 12px 0 0}
+.hdr h1{font-size:20px;margin-bottom:4px}.hdr .sub{font-size:13px;opacity:.85}
+.card{background:white;padding:20px;border-radius:0 0 12px 12px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.card+.card{margin-top:14px;border-radius:12px}
+.card h2{font-size:15px;margin-bottom:12px;color:#444;border-left:3px solid #667eea;padding-left:10px}
+.row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0}.row:last-child{border:none}.row .k{color:#888;font-size:13px}.row .v{font-size:13px;font-weight:500}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600}.badge.on{background:#d4f5d4;color:#2d7a2d}.badge.off{background:#f5d4d4;color:#a03030}.badge.warn{background:#fff3cd;color:#8a6d3b}
+label{display:block;font-size:13px;color:#666;margin-bottom:4px}
+input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border-radius:6px;font-size:14px;margin-bottom:10px}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.btn{padding:8px 20px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;color:white;display:inline-block;text-decoration:none}.btn:hover{transform:translateY(-1px);box-shadow:0 2px 6px rgba(0,0,0,.15)}.btn-primary{background:#667eea}.btn-warn{background:#f39c12}.btn-danger{background:#e74c3c}.btn-green{background:#27ae60}.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.hint{color:#888;font-size:12px;margin-top:8px;line-height:1.5}.msg{padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;display:none}.msg.ok{background:#d4f5d4;color:#2d7a2d;display:block}.msg.err{background:#f5d4d4;color:#a03030;display:block}.qrbox{text-align:center;padding:16px 0}
+</style>
+</head>
+<body>
+<div class="c">
+<div class="hdr"><h1>飞牛音乐酷狗增强</h1><div class="sub">KuGouMusicApi 音源与扫码登录</div></div>
+<div id="msg" class="msg"></div>
+<div class="card">
+<h2>服务状态</h2>
+<div class="row"><span class="k">扩展服务</span><span class="v"><span class="badge warn" id="health-badge">检测中</span></span></div>
+<div class="row"><span class="k">上游音乐</span><span class="v" id="upstream">检测中</span></div>
+<div class="row"><span class="k">KuGou 源</span><span class="v" id="kugou">检测中</span></div>
+</div>
+<div class="card">
+<h2>KuGou 音源配置</h2>
+<label>API 地址</label>
+<input type="text" id="kugou_url" placeholder="http://127.0.0.1:8899">
+<label>音质 (kbps)</label>
+<select id="kugou_quality">
+<option value="high">high</option><option value="320">320</option><option value="128">128</option><option value="64">64</option>
+</select>
+<label>启用状态</label>
+<select id="kugou_enabled"><option value="1">启用</option><option value="0">停用</option></select>
+<div class="btns"><button class="btn btn-green" onclick="saveSettings()">保存配置</button><button class="btn btn-primary" onclick="loadAll()">刷新</button></div>
+<div class="hint">保存后请重启扩展应用，使 KuGou 源配置生效。</div>
+</div>
+<div class="card">
+<h2>边播边存</h2>
+<div class="row"><span class="k">功能状态</span><span class="v"><span class="badge off" id="save-badge">未开启</span></span></div>
+<label>启用边播边存</label>
+<select id="save_enabled"><option value="1">开启（完整播放后归档到曲库）</option><option value="0">关闭</option></select>
+<label>落盘目录（留空 = 使用飞牛曲库目录）</label>
+<input type="text" id="save_dir" placeholder="例如 /vol1/1000/music/kugou">
+<div class="hint" id="save-dir-hint">探测中...</div>
+<label>归档内容</label>
+<select id="save_write_tags"><option value="1">写标签 + 歌词 + 封面（推荐）</option><option value="0">只存音频文件</option></select>
+<label>封面</label>
+<select id="save_write_cover"><option value="1">内嵌封面，并另存同名图片</option><option value="0">不处理封面</option></select>
+<label>歌词</label>
+<select id="save_write_lyric"><option value="1">另存同名 .lrc</option><option value="0">不存歌词</option></select>
+<label>去重索引目录（留空 = 跟随落盘目录，推荐）</label>
+<input type="text" id="save_marker_dir" placeholder="留空即可，会自动放到落盘目录下的 .fnmusic_save_index">
+<div class="hint" id="save-marker-hint">探测中...</div>
+<div class="btns"><button class="btn btn-green" onclick="saveSaveOpts()">保存边播边存设置</button></div>
+<div class="hint">开启后，<b>完整播放</b>一首在线歌曲（不拖动进度条、不中途切歌）才会归档到曲库，之后可离线播放。拖动/切歌只存了部分字节时不会误存半首歌。<br>
+文件名为「歌手 - 歌名」，已归档过的不会重复保存；写盘先写临时文件再原子替换，避免飞牛扫描到半截文件。<br>
+落盘目录必须位于飞牛共享曲库内（否则飞牛音乐扫不到）；含 <code>..</code> 或经符号链接逃出曲库的路径会被拒绝。<br>
+<b>去重索引目录</b>用来记「哪首歌已经存过」。留空时会自动放到落盘目录下的隐藏目录，跟着曲库走——这样覆盖安装/升级扩展不会丢索引，也就不会把听过的歌再存一遍成「歌名 (2)」。</div>
+</div>
+<div class="card">
+<h2>登录与配置文件</h2>
+<div class="row"><span class="k">配置文件</span><span class="v" id="env-file" style="word-break:break-all;font-size:12px">探测中...</span></div>
+<div class="hint">登录凭证与所有设置都存这里。<b>它不在应用安装目录内</b>，所以覆盖安装 / 升级扩展都不会把登录态冲掉——早先版本把配置放在安装目录里，升一次级就要重扫一次码，已修。</div>
+<label>在线收藏目录（留空 = 应用数据目录，推荐）</label>
+<input type="text" id="fav_dir" placeholder="留空即可">
+<div class="hint">酷狗在线收藏的本地记录。默认放在应用持久数据目录，不在安装目录内，升级不丢。当前实际位置：<code id="fav-dir-eff">探测中...</code></div>
+<label>搜索超时（秒）</label>
+<input type="text" id="kugou_search_timeout" placeholder="15">
+<label>单曲归档体积上限（字节）</label>
+<input type="text" id="save_max_bytes" placeholder="536870912">
+<label>单曲归档超时（秒）</label>
+<input type="text" id="save_timeout_s" placeholder="300">
+<div class="btns"><button class="btn btn-green" onclick="saveAdvancedOpts()">保存进阶设置</button></div>
+<div class="hint">进阶项一般不用改。改完需重启扩展应用生效。</div>
+</div>
+<div class="card">
+<h2>KuGou 登录</h2>
+<div class="row"><span class="k">登录状态</span><span class="v"><span class="badge off" id="login-badge">未登录</span></span></div>
+<div class="row" id="login-userid" style="display:none"><span class="k">用户ID</span><span class="v" id="login-userid-val"></span></div>
+<div class="btns"><button class="btn btn-primary" id="btn-login" onclick="showQRLogin()">扫码登录</button><button class="btn btn-danger" id="btn-logout" onclick="doLogout()" style="display:none">退出登录</button></div>
+<div class="qrbox" id="qr-login-container" style="display:none"><div id="qr-image" style="margin-bottom:12px"></div><div id="qr-status">正在生成二维码...</div><div id="qr-timer" style="font-size:12px;color:#999;margin-top:8px"></div></div>
+</div>
+</div>
+<script>
+const API=location.pathname.replace(/\/$/,'');
+let qrPollTimer=null, qrExpireTimer=null;
+function show(t,m){var e=document.getElementById('msg');e.className='msg '+t;e.textContent=m;}
+function hideMsg(){document.getElementById('msg').className='msg';}
+async function jget(path){const r=await fetch(API+path);return await r.json();}
+async function post(path,body,retries){retries=retries==null?2:retries;let lastErr;for(let i=0;i<=retries;i++){try{const r=await fetch(API+path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''});if(!r.ok){let detail='';try{const t=await r.text();detail=t?` (${t})`:'';}catch(e){}const err=new Error('HTTP '+r.status+detail);lastErr=err;if(i<retries){await new Promise(rs=>setTimeout(rs,700));continue;}throw err;}return await r.json();}catch(e){lastErr=e;if(i<retries){await new Promise(rs=>setTimeout(rs,700));continue;}throw e;}}}
+async function loadHealth(){try{const d=await jget('/_ext/healthz');const b=document.getElementById('health-badge');b.className='badge '+(d.ok?'on':'off');b.textContent=d.ok?'正常':'异常';document.getElementById('upstream').textContent=d.upstream||'unknown';document.getElementById('kugou').textContent=d.kugou||'unknown';}catch(e){}}
+async function loadSettings(){try{const d=await jget('/_ext/settings');document.getElementById('kugou_url').value=d.kugou_url||'http://127.0.0.1:8899';document.getElementById('kugou_quality').value=d.kugou_quality||'high';document.getElementById('kugou_enabled').value=d.kugou_enabled?'1':'0';}catch(e){}}
+async function loadSaveOpts(){try{
+const d=await jget('/_ext/settings');
+const b=document.getElementById('save-badge');
+if(d.save_enabled){b.className='badge on';b.textContent='已开启';}else{b.className='badge off';b.textContent='未开启';}
+document.getElementById('save_enabled').value=d.save_enabled?'1':'0';
+document.getElementById('save_dir').value=d.save_dir||'';
+document.getElementById('save_write_tags').value=d.save_write_tags?'1':'0';
+document.getElementById('save_write_cover').value=d.save_write_cover?'1':'0';
+document.getElementById('save_write_lyric').value=d.save_write_lyric?'1':'0';
+document.getElementById('save_marker_dir').value=d.save_marker_dir||'';
+const roots=(d.save_dir_roots&&d.save_dir_roots.length)?d.save_dir_roots.join('、'):'（未探测到）';
+const eff=d.save_dir||d.save_dir_effective||'';
+document.getElementById('save-dir-hint').textContent='飞牛曲库根目录：'+roots+'　当前实际落点：'+(eff||'未知');
+const mk=d.save_marker_dir_effective||'';
+document.getElementById('save-marker-hint').textContent=d.save_marker_dir?('去重索引：'+(mk||'未知')):('去重索引：'+(mk||'未知')+'（跟随落盘目录，推荐）');
+document.getElementById('env-file').textContent=d.env_file||'未知';
+document.getElementById('fav_dir').value=d.fav_dir||'';
+document.getElementById('fav-dir-eff').textContent=d.fav_dir_effective||'未知';
+document.getElementById('kugou_search_timeout').value=(d.kugou_search_timeout===undefined?'':d.kugou_search_timeout);
+document.getElementById('save_max_bytes').value=(d.save_max_bytes===undefined?'':d.save_max_bytes);
+document.getElementById('save_timeout_s').value=(d.save_timeout_s===undefined?'':d.save_timeout_s);
+}catch(e){document.getElementById('save-dir-hint').textContent='读取设置失败：'+e.message;}}
+async function saveSaveOpts(){try{const qs=['save=1','save_enabled='+document.getElementById('save_enabled').value,'save_dir='+encodeURIComponent(document.getElementById('save_dir').value.trim()),'save_marker_dir='+encodeURIComponent(document.getElementById('save_marker_dir').value.trim()),'save_write_tags='+document.getElementById('save_write_tags').value,'save_write_cover='+document.getElementById('save_write_cover').value,'save_write_lyric='+document.getElementById('save_write_lyric').value].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
+async function saveAdvancedOpts(){try{const v=(id)=>document.getElementById(id).value.trim();const qs=['save=1','fav_dir='+encodeURIComponent(v('fav_dir')),'kugou_search_timeout='+encodeURIComponent(v('kugou_search_timeout')),'save_max_bytes='+encodeURIComponent(v('save_max_bytes')),'save_timeout_s='+encodeURIComponent(v('save_timeout_s'))].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
+async function loadLogin(){try{const d=await jget('/_ext/login/status');const b=document.getElementById('login-badge');if(d.status==='logged_in'){b.className='badge on';b.textContent='已登录';document.getElementById('login-userid').style.display='flex';document.getElementById('login-userid-val').textContent=d.userid||'';document.getElementById('btn-login').style.display='none';document.getElementById('btn-logout').style.display='inline-block';}else{b.className='badge off';b.textContent='未登录';document.getElementById('login-userid').style.display='none';document.getElementById('btn-login').style.display='inline-block';document.getElementById('btn-logout').style.display='none';}}catch(e){}}
+async function loadAll(){hideMsg();loadHealth();loadSettings();loadSaveOpts();loadLogin();}
+async function saveSettings(){try{const qs=['save=1','kugou_url='+encodeURIComponent(document.getElementById('kugou_url').value.trim()),'kugou_quality='+encodeURIComponent(document.getElementById('kugou_quality').value),'kugou_enabled='+encodeURIComponent(document.getElementById('kugou_enabled').value)].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
+async function showQRLogin(){document.getElementById('qr-login-container').style.display='block';document.getElementById('qr-image').innerHTML='';document.getElementById('qr-status').textContent='正在生成二维码...';try{const d=await jget('/_ext/login/qr/create');if(d.status==='ok'){document.getElementById('qr-image').innerHTML='<img src="'+d.qrCode+'" style="width:220px;height:220px;border-radius:8px" alt="登录二维码">';document.getElementById('qr-status').textContent='请使用酷狗音乐 APP 扫码';startPoll(d.key);qrExpireTimer=setTimeout(()=>{document.getElementById('qr-status').textContent='二维码可能已过期，请重新生成';},120000);}else{document.getElementById('qr-status').textContent='生成失败：'+(d.message||d.status);}}catch(e){document.getElementById('qr-status').textContent='请求失败：'+e.message;}}
+function startPoll(key){if(qrPollTimer)clearInterval(qrPollTimer);qrPollTimer=setInterval(async()=>{try{const d=await jget('/_ext/login/qr/check?key='+encodeURIComponent(key));if(d.status==='authenticated'){clearInterval(qrPollTimer);if(qrExpireTimer)clearTimeout(qrExpireTimer);document.getElementById('qr-status').textContent='登录成功！'+(d.nickname?' ('+d.nickname+')':'');document.getElementById('qr-status').style.color='#27ae60';setTimeout(loadAll,800);}else if(d.status==='scanned'){document.getElementById('qr-status').textContent='已扫码，请在酷狗音乐确认登录';}else if(d.status==='expired'){clearInterval(qrPollTimer);document.getElementById('qr-status').textContent='二维码已过期，请重新生成';}}catch(e){}},2000);}
+async function doLogout(){if(!confirm('确定退出 KuGou 登录？'))return;try{const d=await jget('/_ext/login/logout');show(d.status==='ok'?'ok':'err',d.message||'已退出');loadLogin();}catch(e){show('err','退出失败：'+e.message);}}
+loadAll();
+</script>
+</body>
+</html>

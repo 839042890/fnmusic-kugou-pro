@@ -1,0 +1,6 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+# Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+# fnmusic-pro cmd/upgrade_init
+exit 0

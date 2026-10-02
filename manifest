@@ -1,0 +1,14 @@
+appname               = fnmusic_kugou_pro
+version               = 1.0.0
+display_name          = 飞牛音乐酷狗增强
+desc                  = 为飞牛音乐接入自建 KuGouMusicApi 作为外部音源，支持搜索、在线播放、歌词、边播边存。零侵入 Unix Socket 接管架构，不修改飞牛官方 nginx、二进制或数据库。本包为独立分叉分支（fnmusic_kugou_pro），与上游 fnmusic_ext_kugou 不共存。
+maintainer            = 星痕在此
+distributor           = 星痕在此
+source                = thirdparty
+platform              = x86
+os_min_version        = 1.2.0
+install_dep_apps      = trim.music:python312
+desktop_uidir         = ui
+desktop_applaunchname = fnmusic_kugou_pro.main
+changelog             = 1.0.0: 独立分叉首发（fnmusic_kugou_pro / 飞牛音乐酷狗增强），由 星痕在此 基于 ai2ku 的 fnmusic_ext_kugou 深度重构并独立维护。相对上游基线 v2.1.0 的改动：(1) 应用全面改名 —— 应用名、socket 名、/tmp 临时文件、gateway 前缀、路由前缀、桌面启动项一处不留；(2) 修复配置文件加载与写入缺少输入校验（高风险，相关进程以 root 运行）—— 配置文件改为逐行解析 + 键名校验 + 取值校验，写入侧新增 _sanitize_env_value()，把任意输入归一化为安全单行；(3) 修复 kugou_url 无校验导致的 SSRF —— 新增 _sanitize_kugou_url()，仅放行 http:// 与 https://，其余返回 400；(4) 修复凭据文件 .env 权限过宽（0666 → 0600）—— 安装改为 0600，并新增统一原子写入入口 write_env_updates()；(5) 边播边存重写 —— 归档判定不再只看单个请求的形态（飞牛音乐播放器是分块 Range 读取），超过内存缓存上限（48MiB）的曲目改为字节直传，不再静默丢弃；(6) 持久化状态迁出安装目录 —— 落盘目录、去重标记、登录态改走配置/数据目录，避免覆盖安装时被整体替换而丢失；(7) 新增音乐接口占用检测 —— 启动时若 /var/run/trim_music.socket 已被其他音源扩展接管则拒绝启动并提示，避免两个扩展互相拆台；(8) 修复应用图标不显示 —— 补齐 16/24/32/48/64/72/96/128/256 全套尺寸阶梯，并新增字面量兜底 icon_{0}.png（上游只带 icon_64/icon_256 两张，且 icon_64.png 中实为 256x256 的图，名不副实）；(9) 补齐 GPL-2.0 协议全文；(10) 移除按上游基线无迁移义务的旧版升级迁移逻辑（死代码）。功能面：搜索 / 在线播放 / 歌词 / 封面 / 边播边存 / 扫码登录。仍以 GPL-2.0-or-later 发布，完整保留原作者署名。
+checksum              = 18e05bd71dc1a9f3c6d765c6c11379f1

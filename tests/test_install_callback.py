@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""cmd/install_callback 生成 .env 的行为测试。
+
+覆盖（都是实际踩过的坑）：
+1. 向导里填的 FNMUSIC_* 以同名环境变量传入，必须写进 .env，不能被默认值覆盖。
+2. 重装/覆盖安装时不能把用户已存的 token、落盘目录清空。
+3. 值里带换行/控制字符不能破坏 .env 行结构。
+4. v2.1.3 起 .env 写进**持久配置目录**（TRIM_PKGETC → @appconf/<app>），
+   不再落安装目录；写成功后清掉安装目录里的旧文件。
+
+关于布局：归属校验要求路径里出现"应用名"这一段，所以假的 APPDEST 必须放在
+形如 <tmp>/fnmusic_kugou_pro/... 的路径下；同时**必须显式设置** TRIM_PKG*，
+否则本机存在 /var/apps/fnmusic_kugou_pro/etc 符号链接，脚本会真的往系统
+配置目录写（这个测试跑在非 root 下会因此失败）。
+
+运行：PYTHONPATH= /tmp/tv3/bin/python tests/test_install_callback.py
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PKG = HERE.parent
+INSTALL = PKG / "cmd" / "install_callback"
+APP = "fnmusic_kugou_pro"
+
+PASS, FAIL = [], []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    (PASS if cond else FAIL).append(name)
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"   [{detail}]" if detail and not cond else ""))
+
+
+class Layout:
+    """形状与飞牛一致的应用根：<root>/<app>/{app,etc,var,home}。"""
+
+    def __init__(self, prefix: str):
+        self.root = Path(tempfile.mkdtemp(prefix=prefix)) / APP
+        self.appdest = self.root / "app"          # 安装目录 target
+        self.etc = self.root / "etc"              # → @appconf/<app>
+        self.var = self.root / "var"              # → @appdata/<app>
+        self.home = self.root / "home"            # → @apphome/<app>
+        for p in (self.appdest, self.etc, self.var, self.home):
+            p.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def env_file(self) -> Path:
+        return self.etc / ".env"
+
+    @property
+    def legacy_env_file(self) -> Path:
+        return self.appdest / ".env"
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.root.parent, ignore_errors=True)
+
+
+def run_install(lay: Layout, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """在假布局上跑 install_callback（venv 用空壳文件骗过依赖安装）。"""
+    proxy = lay.appdest / "proxy"
+    proxy.mkdir(parents=True, exist_ok=True)
+    (proxy / "requirements.txt").write_text("")
+    venv_bin = lay.appdest / ".venv-proxy" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    for name in ("pip", "uvicorn", "python3"):
+        p = venv_bin / name
+        p.write_text("#!/bin/sh\nexit 0\n")
+        p.chmod(0o755)
+
+    env = dict(os.environ)
+    env["TRIM_APPDEST"] = str(lay.appdest)
+    env["TRIM_TEMP_LOGFILE"] = str(lay.appdest / "install.log")
+    # 显式注入持久目录：不设的话本机 /var/apps/<app>/etc 链接会被认到，
+    # 脚本就往真实系统目录写了。
+    env["TRIM_PKGETC"] = str(lay.etc)
+    env["TRIM_PKGVAR"] = str(lay.var)
+    env["TRIM_PKGHOME"] = str(lay.home)
+    # 让 install_callback 找到的"python3.12"是我们能控制的空壳
+    env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(["bash", str(INSTALL)], env=env,
+                          capture_output=True, text=True)
+
+
+def read_env(lay: Layout) -> dict[str, str]:
+    out = {}
+    p = lay.env_file
+    if not p.exists():
+        return out
+    for line in p.read_text().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
+
+
+def main() -> None:
+    # ---------------------------------------------------------------- 1
+    print("=" * 70)
+    print("1) 向导填的值必须写进 .env（不能被默认值覆盖）+ 落到配置目录")
+    print("=" * 70)
+    L = Layout("fnmusic-inst-")
+    r = run_install(L, {
+        "FNMUSIC_KUGOU_URL": "http://10.0.0.9:8899",
+        "FNMUSIC_KUGOU_QUALITY": "320",
+        "FNMUSIC_LIBRARY_DIR": "/vol1/music",
+    })
+    check("install_callback 退出码 0", r.returncode == 0, f"{r.returncode} {r.stderr[-300:]}")
+    env = read_env(L)
+    check(".env 落在配置目录（不在安装目录）", L.env_file.is_file(), str(L.env_file))
+    check("安装目录里没有留下 .env", not L.legacy_env_file.exists(),
+          str(L.legacy_env_file))
+    check("向导的 URL 保留了", env.get("FNMUSIC_KUGOU_URL") == "http://10.0.0.9:8899",
+          env.get("FNMUSIC_KUGOU_URL", ""))
+    check("向导的音质保留了", env.get("FNMUSIC_KUGOU_QUALITY") == "320",
+          env.get("FNMUSIC_KUGOU_QUALITY", ""))
+    check("向导的曲库目录保留了", env.get("FNMUSIC_LIBRARY_DIR") == "/vol1/music",
+          env.get("FNMUSIC_LIBRARY_DIR", ""))
+    check(".env 权限是 600", stat.S_IMODE(L.env_file.stat().st_mode) == 0o600,
+          oct(stat.S_IMODE(L.env_file.stat().st_mode)))
+    check("配置目录权限是 700", stat.S_IMODE(L.etc.stat().st_mode) == 0o700,
+          oct(stat.S_IMODE(L.etc.stat().st_mode)))
+    check("边播边存默认关闭", env.get("FNMUSIC_SAVE_ENABLED") == "0",
+          env.get("FNMUSIC_SAVE_ENABLED", ""))
+    check("归档内容默认全开",
+          (env.get("FNMUSIC_SAVE_WRITE_TAGS"), env.get("FNMUSIC_SAVE_WRITE_COVER"),
+           env.get("FNMUSIC_SAVE_WRITE_LYRIC")) == ("1", "1", "1"))
+    check("收藏目录默认为空（让 app 端推导到持久 home，见 test_persist_dirs 第 8 节）",
+          env.get("FNMUSIC_FAV_DIR") == "", repr(env.get("FNMUSIC_FAV_DIR")))
+    check("收藏目录不指向安装目录", str(L.appdest) not in env.get("FNMUSIC_FAV_DIR", ""),
+          env.get("FNMUSIC_FAV_DIR", ""))
+    # .env 里不允许出现重复键：读回时以后者为准，排障时极易看错
+    keys = [ln.split("=", 1)[0] for ln in L.env_file.read_text().splitlines() if "=" in ln]
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    check(".env 没有重复键", not dupes, str(dupes))
+
+    # ---------------------------------------------------------------- 2
+    print()
+    print("=" * 70)
+    print("2) 重装/覆盖安装：已有 token 与落盘设置不能被清空")
+    print("=" * 70)
+    p = L.env_file
+    txt = p.read_text()
+    txt = txt.replace("FNMUSIC_KUGOU_TOKEN=", "FNMUSIC_KUGOU_TOKEN=SECRET123")
+    txt = txt.replace("FNMUSIC_KUGOU_USERID=", "FNMUSIC_KUGOU_USERID=77777")
+    txt = txt.replace("FNMUSIC_SAVE_ENABLED=0", "FNMUSIC_SAVE_ENABLED=1")
+    txt = txt.replace("FNMUSIC_SAVE_DIR=", "FNMUSIC_SAVE_DIR=/vol1/music/saved")
+    p.write_text(txt)
+
+    # 重装时向导没填（不导出同名环境变量）
+    r = run_install(L)
+    check("重装退出码 0", r.returncode == 0, f"{r.returncode} {r.stderr[-300:]}")
+    env = read_env(L)
+    check("token 没被清空", env.get("FNMUSIC_KUGOU_TOKEN") == "SECRET123",
+          env.get("FNMUSIC_KUGOU_TOKEN", ""))
+    check("userid 没被清空", env.get("FNMUSIC_KUGOU_USERID") == "77777",
+          env.get("FNMUSIC_KUGOU_USERID", ""))
+    check("边播边存开关没被重置", env.get("FNMUSIC_SAVE_ENABLED") == "1",
+          env.get("FNMUSIC_SAVE_ENABLED", ""))
+    check("落盘目录没被清空", env.get("FNMUSIC_SAVE_DIR") == "/vol1/music/saved",
+          env.get("FNMUSIC_SAVE_DIR", ""))
+    check("重装后 URL 仍是上次的值", env.get("FNMUSIC_KUGOU_URL") == "http://10.0.0.9:8899",
+          env.get("FNMUSIC_KUGOU_URL", ""))
+
+    # ---------------------------------------------------------------- 2b
+    print()
+    print("=" * 70)
+    print("2b) 【1.0.0 分叉】已删除旧版迁移 —— 安装目录的 .env 不该被迁移")
+    print("=" * 70)
+    # 依据：本分支以上游 2.1.0 为基线，2.1.0 起 .env 就在配置目录，
+    # 不存在"安装目录里的旧 .env"这种历史上需要救援的状态。
+    # 这个用例是**回归守卫**：防止将来有人"好心"把迁移逻辑加回来。
+    L2 = Layout("fnmusic-inst2-")
+    L2.legacy_env_file.write_text(
+        "FNMUSIC_KUGOU_TOKEN=OLDTOKEN999\n"
+        "FNMUSIC_KUGOU_USERID=1234567890\n"
+        "FNMUSIC_SAVE_DIR=/vol1/music/old\n",
+        encoding="utf-8",
+    )
+    r = run_install(L2)
+    check("退出码 0（不因该文件报错）", r.returncode == 0, f"{r.returncode} {r.stderr[-300:]}")
+    env2 = read_env(L2)
+    check("安装目录的旧 token 未被迁移进配置目录",
+          env2.get("FNMUSIC_KUGOU_TOKEN") != "OLDTOKEN999",
+          repr(env2.get("FNMUSIC_KUGOU_TOKEN")))
+    check("安装目录的旧落盘目录未被迁移",
+          env2.get("FNMUSIC_SAVE_DIR") != "/vol1/music/old",
+          repr(env2.get("FNMUSIC_SAVE_DIR")))
+    check("配置目录 .env 由向导默认值生成（不是迁移来的）",
+          env2.get("FNMUSIC_KUGOU_URL") != "",
+          repr(env2.get("FNMUSIC_KUGOU_URL")))
+
+    # ---------------------------------------------------------------- 2c
+    print()
+    print("=" * 70)
+    print("2c) 【1.0.0 分叉】升级回调不再做任何迁移")
+    print("=" * 70)
+    up = (PKG / "cmd" / "upgrade_callback").read_text(encoding="utf-8")
+    up_code = "\n".join(
+        ln for ln in up.splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    check("upgrade_callback 无 .env 迁移代码", "OLD_ENV" not in up_code and "NEW_ENV" not in up_code)
+    check("upgrade_callback 无在线收藏迁移代码",
+          "online_favorites" not in up_code)
+    check("upgrade_callback 仅做语法检查（不阻断）", "py_compile" in up_code)
+
+    # ---------------------------------------------------------------- 3
+    print()
+    print("=" * 70)
+    print("3) 环境变量里塞换行/控制字符，不能破坏 .env 行结构")
+    print("=" * 70)
+    L4 = Layout("fnmusic-inst4-")
+    r = run_install(L4, {
+        "FNMUSIC_KUGOU_URL": "http://1.2.3.4:8899\nFNMUSIC_SAVE_ENABLED=99\nTOUCHED=1",
+    })
+    check("注入场景退出码 0", r.returncode == 0, f"{r.returncode} {r.stderr[-300:]}")
+    raw = L4.env_file.read_text()
+    env = read_env(L4)
+    check("换行被剔除，没有多出键", "TOUCHED" not in env, str(sorted(env)))
+    # 期望键数直接从安装脚本里数（echo "FNMUSIC_X=..." 的数量），
+    # 这样加/删配置项时这个断言会自动跟上，不用手改数字。
+    import re as _re
+    script = (PKG / "cmd" / "install_callback").read_text(encoding="utf-8")
+    expected_keys = len(set(_re.findall(r'echo "(FNMUSIC_[A-Z0-9_]+)=', script)))
+    check(".env 行数没被撑开", len(raw.splitlines()) == expected_keys,
+          f"{len(raw.splitlines())} != {expected_keys}")
+    check("注入后仍是预期键集合", len(env) == expected_keys,
+          f"{len(env)} != {expected_keys}")
+    check("注入没能改写开关", env.get("FNMUSIC_SAVE_ENABLED") == "0",
+          env.get("FNMUSIC_SAVE_ENABLED", ""))
+
+    # ---------------------------------------------------------------- 4
+    print()
+    print("=" * 70)
+    print("4) 归属校验函数 pick_pkg_dir：TRIM_* 串到别的应用必须拒绝")
+    print("=" * 70)
+    # 不直接跑 install_callback：TRIM_PKGETC 被拒后它会退回
+    # /var/apps/<app>/etc（**真实系统目录**），在非 root 下写不进去、
+    # 还会污染机器。改为把脚本里的 pick_pkg_dir 抠出来单独喂输入 ——
+    # 这正是要测的那个纯函数。
+    script = INSTALL.read_text(encoding="utf-8")
+    fn = script[script.index("pick_pkg_dir() {"):]
+    fn = fn[:fn.index("\n}\n") + 3]
+    # 用一个**不存在**的链接路径当第二档，这样"被拒"的用例必然落到兜底，
+    # 断言才能明确区分"接受了注入值"和"退到兜底"。
+    probe = f'''
+PKG_APP_NAME="{APP}"
+LOGF="/dev/null"
+{fn}
+printf '%s\\n' "$(pick_pkg_dir TRIM_PKGETC /nonexistent/pkg/{APP}/etc /fallback)"
+'''
+    checks = [
+        # (注入值, 期望, 说明)
+        ("/vol1/@appconf/someapp", "/fallback",
+         "外应用（末段是别的应用名）被拒"),
+        ("/vol1/@appdata/someapp/etc", "/fallback",
+         "外应用（应用名在中间）被拒"),
+        ("", "/fallback",
+         "空值 → 走链接/兜底"),
+        ("/vol1/@appconf/fnmusic_kugou_pro", "/vol1/@appconf/fnmusic_kugou_pro",
+         "本应用（末段是应用名）被接受"),
+        ("/var/apps/fnmusic_kugou_pro/etc", "/var/apps/fnmusic_kugou_pro/etc",
+         "本应用（应用名在中间）被接受"),
+        ("/vol1/@appconf/fnmusic_kugou_pro_extra", "/fallback",
+         "仅前缀相似但不是整段 → 仍被拒"),
+    ]
+    for val, want, desc in checks:
+        env = dict(os.environ)
+        env["TRIM_PKGETC"] = val
+        r = subprocess.run(["bash", "-c", probe], env=env,
+                           capture_output=True, text=True)
+        got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        check(desc, got == want, f"得到 {got!r}，期望 {want!r}")
+
+    for obj in (L, L2, L4):
+        obj.cleanup()
+
+
+try:
+    main()
+finally:
+    print()
+    print("=" * 70)
+    print(f"结果：{len(PASS)} 通过 / {len(FAIL)} 失败")
+    print("=" * 70)
+    if FAIL:
+        print("失败项：")
+        for f in FAIL:
+            print("  -", f)
+
+sys.exit(1 if FAIL else 0)

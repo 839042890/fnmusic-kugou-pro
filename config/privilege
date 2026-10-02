@@ -1,0 +1,7 @@
+{
+    "defaults": {
+        "run-as": "root"
+    },
+    "username": "fnmusic_kugou_pro",
+    "groupname": "fnmusic_kugou_pro"
+}

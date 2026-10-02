@@ -1,0 +1,9 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+# Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+# fnmusic-pro cmd/install_init
+# 只做必要前置检查，Python 由 install_callback 全权处理
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/tmp/fnmusic-pro-install.log}"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+exit 0

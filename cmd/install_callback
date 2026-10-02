@@ -1,0 +1,282 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+# Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+# fnmusic-pro cmd/install_callback
+# 每步都写日志，便于诊断
+
+LOGF="$TRIM_TEMP_LOGFILE"
+if [ -z "$LOGF" ]; then
+    LOGF="/tmp/fnmusic-pro-install.log"
+fi
+mkdir -p "$(dirname "$LOGF")" 2>/dev/null || true
+
+echo "[install_callback] START whoami=$(id -un) @ $(date)" >> "$LOGF"
+
+APPDEST="$TRIM_APPDEST"
+if [ -z "$APPDEST" ] || [ ! -d "$APPDEST" ]; then
+    echo "[install_callback] FAIL: APPDEST 空/不存在" >> "$LOGF"
+    exit 1
+fi
+
+echo "[install_callback] APPDEST=$APPDEST" >> "$LOGF"
+
+# ===== 音乐接口占用检测（1.0.0 新增，早失败、不留半成品）=====
+# 本应用接管 /var/run/trim_music.socket。若该 socket 已被**另一个音源扩展**
+# （典型：上游 fnmusic_ext_kugou）占用，两版将无法共存 —— 两者的 uninstall
+# 脚本都会"见 TARGET 是代理就删掉它并搬回真音乐"，卸载任一方都会静默拆掉
+# 另一方。旧版代码改不了，只能靠"装之前先确认没人占着"来防。
+#
+# 判据用 live socket 而非目录是否存在：@appconf 里有 22 个已卸载应用的残留
+# 目录，用目录判断会"自锁、永远装不上"。
+#
+# 安装阶段这里只做**告警**、不阻断（阻断交由 cmd/main start 执行）：
+# 飞牛的 install_callback 若直接 exit 1，用户看到的只是一个失败提示，
+# 而真正常见的场景是"用户已卸载旧版但旧版进程/socket 还没退干净"，
+# 此时硬失败会让用户反复重装却不明白原因。启动时再判定更准确、
+# 且那才是真正会造成"两版共存"的时刻。若确实被占用，启动会明确拒绝。
+TARGET_SOCK="/var/run/trim_music.socket"
+if [ -S "$TARGET_SOCK" ]; then
+    _h="$(curl -s --max-time 2 --unix-socket "$TARGET_SOCK" http://localhost/_ext/healthz 2>/dev/null || true)"
+    if echo "$_h" | grep -q '"upstream"'; then
+        _pid="$(ss -xlp 2>/dev/null | grep -F "$TARGET_SOCK" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+        _cmd=""
+        [ -n "$_pid" ] && [ -r "/proc/$_pid/cmdline" ] && _cmd="$(tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null)"
+        echo "[install_callback] WARN: 音乐接口已被其他音源扩展占用 -> pid=$_pid cmd=$_cmd" >> "$LOGF"
+        echo "[install_callback] WARN: 请先到【应用中心】停用并卸载旧扩展 fnmusic_ext_kugou，" >> "$LOGF"
+        echo "[install_callback] WARN: 否则本应用启动时会被拒绝（详见 说明.md）。" >> "$LOGF"
+    else
+        echo "[install_callback] 音乐接口当前由飞牛音乐本体持有（正常）" >> "$LOGF"
+    fi
+fi
+
+# 官方契约：Python 3.12 依赖路径
+export PATH="/var/apps/python312/target/bin:/var/apps/python312/bin:/vol1/@appcenter/python312/bin:$PATH"
+
+# 找 Python 3.12
+PY312=""
+for CAND in python3.12 python3 python; do
+    if command -v "$CAND" >/dev/null 2>&1; then
+        V=$("$CAND" --version 2>/dev/null)
+        case "$V" in
+            *3.12*) PY312="$CAND" ;;
+        esac
+    fi
+    if [ -n "$PY312" ]; then break; fi
+done
+
+if [ -z "$PY312" ]; then
+    echo "[install_callback] FAIL: 未找到 Python 3.12" >> "$LOGF"
+    exit 1
+fi
+
+echo "[install_callback] PY312=$PY312" >> "$LOGF"
+
+# 建目录
+APP_DIR="$APPDEST/app"
+if [ ! -f "$APP_DIR/proxy/requirements.txt" ] && [ -f "$APPDEST/proxy/requirements.txt" ]; then
+    APP_DIR="$APPDEST"
+fi
+if [ ! -f "$APP_DIR/proxy/requirements.txt" ]; then
+    echo "[install_callback] FAIL: 未找到 proxy/requirements.txt（APP_DIR=$APP_DIR）" >> "$LOGF"
+    exit 1
+fi
+
+mkdir -p "$APP_DIR/cache" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir cache" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/play_history" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir play_history" >> "$LOGF"; exit 1; }
+mkdir -p "$APP_DIR/log" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: mkdir log" >> "$LOGF"; exit 1; }
+
+# ===== 持久化目录 =====
+# 上面那几个 mkdir 是给老版本 / 非飞牛环境的兜底，真正的可变状态不放安装目录：
+# 安装目录（target）覆盖安装时会被整体替换，.env 里存着酷狗登录凭证，
+# 放那儿等于"每次升级掉一次登录"。飞牛给了持久目录：
+#   etc → /vol1/@appconf/<app>   （配置：.env）
+#   var → /vol1/@appdata/<app>   （运行数据：缓存）
+#   home→ /vol1/@apphome/<app>   （用户数据：在线收藏）
+# 推导走 /var/apps/<app>/<sub> 这个飞牛建的符号链接，不要用 $APPDEST/../etc
+# —— APPDEST 是 /vol1/@appcenter/<app> 的真实路径，它的 ../etc 不存在。
+PKG_APP_NAME="fnmusic_kugou_pro"
+PKG_META_DIR="/var/apps/${PKG_APP_NAME}"
+pick_pkg_dir() {
+    local _var="$1" _link="$2" _fallback="$3" _v
+    _v="${!_var:-}"
+    if [ -n "$_v" ]; then
+        # TRIM_* 是"调用方应用"的上下文。串了的话不能认，否则 .env
+        # （含酷狗登录 token）会落到别的应用配置目录去。按"整段路径"匹配，
+        # 因为注入值可能是 @appconf/<app>（末段是应用名），也可能是
+        # /var/apps/<app>/etc（应用名在中间）。
+        case "/$_v/" in
+            */"$PKG_APP_NAME"/*) printf '%s' "$_v"; return ;;
+            *) echo "[install_callback] 忽略 ${_var}=${_v}（不属于 ${PKG_APP_NAME}）" >> "$LOGF" ;;
+        esac
+    fi
+    [ -d "$_link" ] && { printf '%s' "$_link"; return; }
+    printf '%s' "$_fallback"
+}
+ETC_DIR="$(pick_pkg_dir TRIM_PKGETC "${PKG_META_DIR}/etc" "${APPDEST}/etc")"
+VAR_DIR="$(pick_pkg_dir TRIM_PKGVAR "${PKG_META_DIR}/var" "${APPDEST}/var")"
+PKG_HOME_DIR="$(pick_pkg_dir TRIM_PKGHOME "${PKG_META_DIR}/home" "${APPDEST}/home")"
+mkdir -p "$ETC_DIR" "$VAR_DIR" "$PKG_HOME_DIR/online_favorites" >> "$LOGF" 2>&1 \
+    || { echo "[install_callback] FAIL: mkdir 持久目录" >> "$LOGF"; exit 1; }
+chmod 700 "$ETC_DIR" 2>/dev/null || true
+echo "[install_callback] 持久目录 ETC=$ETC_DIR VAR=$VAR_DIR HOME=$PKG_HOME_DIR" >> "$LOGF"
+echo "[install_callback] 目录建好" >> "$LOGF"
+
+# venv
+VENV="$APP_DIR/.venv-proxy"
+if [ ! -x "$VENV/bin/pip" ]; then
+    echo "[install_callback] 创建 venv..." >> "$LOGF"
+    "$PY312" -m venv "$VENV" >> "$LOGF" 2>&1 || { echo "[install_callback] FAIL: venv" >> "$LOGF"; exit 1; }
+    echo "[install_callback] venv 创建成功" >> "$LOGF"
+else
+    echo "[install_callback] venv 已存在" >> "$LOGF"
+fi
+
+VENV_PIP="$VENV/bin/pip"
+VENV_PY="$VENV/bin/python3"
+echo "[install_callback] VENV_PIP=$VENV_PIP" >> "$LOGF"
+
+# 装依赖
+if [ ! -x "$VENV/bin/uvicorn" ]; then
+    REQ="$APP_DIR/proxy/requirements.txt"
+    echo "[install_callback] 装依赖 (REQ=$REQ)" >> "$LOGF"
+
+    # 跳过 pip upgrade，venv 自带 pip 已够新
+    # 用 timeout 避免网络卡住
+    if timeout 300 "$VENV_PIP" install -i "https://pypi.tuna.tsinghua.edu.cn/simple" -r "$REQ" >> "$LOGF" 2>&1; then
+        echo "[install_callback] 依赖安装成功 (清华)" >> "$LOGF"
+    elif timeout 300 "$VENV_PIP" install -i "https://mirrors.aliyun.com/pypi/simple" -r "$REQ" >> "$LOGF" 2>&1; then
+        echo "[install_callback] 依赖安装成功 (阿里)" >> "$LOGF"
+    elif timeout 300 "$VENV_PIP" install -r "$REQ" >> "$LOGF" 2>&1; then
+        echo "[install_callback] 依赖安装成功 (官方)" >> "$LOGF"
+    else
+        echo "[install_callback] FAIL: 依赖安装全部失败" >> "$LOGF"
+        exit 1
+    fi
+else
+    echo "[install_callback] 依赖已安装" >> "$LOGF"
+fi
+
+# 语法检查
+"$VENV_PY" -m py_compile "$APP_DIR/proxy/app.py" "$APP_DIR/proxy/kugou_source.py" >> "$LOGF" 2>&1 || echo "[install_callback] WARN: 语法告警" >> "$LOGF"
+
+# 生成 .env
+#
+# 两个容易踩的坑：
+# 1) 向导（wizard/install|config）里用户填的 FNMUSIC_* 是以**同名环境变量**
+#    传进来的。原实现把 URL/音质写死成默认值，用户填的地址安装完就被覆盖回
+#    127.0.0.1:8899，等于向导白填。这里改成"环境变量优先，缺省才用默认"。
+# 2) 重装/覆盖安装时不能把用户已经存好的 token、落盘目录清空。已经存在的
+#    .env 先读进来当底值，再被环境变量覆盖。
+ENV_FILE="$ETC_DIR/.env"
+# 1.0.0 分叉起：**不再有任何"从安装目录迁移 .env"的逻辑**。
+# 依据：本分支以 fnmusic_ext_kugou 2.1.0 为基线，2.1.0 的 .env 本来
+# 就在配置目录，不存在"安装目录里的旧 .env"这种历史包袱（那是 2.1.1~2.1.2
+# 自迭代期间的问题，无迁移义务）。留着只会让人误以为还有旧数据要救。
+
+# 值清洗：换行/回车/NUL/其它控制字符会破坏 .env 行结构（run_proxy.sh 逐行
+# 解析，且 .env 由网页端可写），一律剔除。
+env_clean() {
+    printf '%s' "$1" | tr -d '\000-\037\177'
+}
+
+# 读已有 .env 里某个 key 的现值（没有则空）。注意必须在重定向截断 .env
+# **之前**调用，否则读到的是刚被 truncate 的空文件。
+# 覆盖安装时用户的登录凭证/落盘设置就在 ENV_FILE 里，必须先读出来当底值，
+# 否则重装一次就"读不到 → 写成空 → 登录态丢失"。
+env_current() {
+    local _f
+    for _f in "$ENV_FILE"; do
+        if [ -f "$_f" ]; then
+            local _v
+            _v="$(grep -m1 "^$1=" "$_f" 2>/dev/null | sed "s/^$1=//")"
+            [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+        fi
+    done
+    return 0
+}
+
+# 取底值：环境变量 > 已有 .env > 默认值
+env_base() {
+    local _key="$1" _default="$2" _val
+    _val="$(env_current "$_key")"
+    [ -n "${_val}" ] || _val="$_default"
+    # 向导填的字段以同名环境变量传入；用 bash 间接展开取，不 eval
+    if [ -n "${!_key:-}" ]; then
+        _val="${!_key}"
+    fi
+    env_clean "${_val}"
+}
+
+KUGOU_ENABLED="$(env_base FNMUSIC_KUGOU_ENABLED 1)"
+KUGOU_URL="$(env_base FNMUSIC_KUGOU_URL "http://127.0.0.1:8899")"
+KUGOU_QUALITY="$(env_base FNMUSIC_KUGOU_QUALITY "high")"
+KUGOU_TIMEOUT="$(env_base FNMUSIC_KUGOU_SEARCH_TIMEOUT 15)"
+LIBRARY_DIR="$(env_base FNMUSIC_LIBRARY_DIR "")"
+SAVE_ENABLED="$(env_base FNMUSIC_SAVE_ENABLED 0)"
+SAVE_DIR="$(env_base FNMUSIC_SAVE_DIR "")"
+SAVE_TAGS="$(env_base FNMUSIC_SAVE_WRITE_TAGS 1)"
+SAVE_COVER="$(env_base FNMUSIC_SAVE_WRITE_COVER 1)"
+SAVE_LYRIC="$(env_base FNMUSIC_SAVE_WRITE_LYRIC 1)"
+# 去重索引目录：默认留空，由 app.py 推导到落盘目录下的隐藏子目录
+# （跟着曲库走，覆盖安装/升级不会丢，也就不会把听过的歌再存一遍）。
+SAVE_MARKER="$(env_base FNMUSIC_SAVE_MARKER_DIR "")"
+# 这几个曾在 .env 里出现但没人回读，一并补齐（值都非凭证，可安全保留旧值）。
+# 注意 FNMUSIC_KUGOU_SEARCH_TIMEOUT 已在上面 KUGOU_TIMEOUT 处理（env_base 本身
+# 就优先环境变量、再旧值），这里不要再 echo 一遍 —— 重复键会让 .env 出现两行
+# 同名条目，读回时以后者为准，排障时极易看错。
+SAVE_MAX_BYTES="$(env_base FNMUSIC_SAVE_MAX_BYTES "")"
+SAVE_TIMEOUT="$(env_base FNMUSIC_SAVE_TIMEOUT_S "")"
+FAV_DIR="$(env_base FNMUSIC_FAV_DIR "")"
+# 凭证类字段：只保留已有值（免得不小心把扫码登录存的 token 冲掉）。
+# 同样必须在写文件之前先读出来。
+TOKEN="$(env_clean "$(env_current FNMUSIC_KUGOU_TOKEN)")"
+USERID="$(env_clean "$(env_current FNMUSIC_KUGOU_USERID)")"
+DFID="$(env_clean "$(env_current FNMUSIC_KUGOU_DFID)")"
+T1="$(env_clean "$(env_current FNMUSIC_KUGOU_T1)")"
+MID="$(env_clean "$(env_current FNMUSIC_KUGOU_MID)")"
+GUID="$(env_clean "$(env_current FNMUSIC_KUGOU_GUID)")"
+DEV="$(env_clean "$(env_current FNMUSIC_KUGOU_DEV)")"
+MACV="$(env_clean "$(env_current FNMUSIC_KUGOU_MAC)")"
+echo "[install_callback] .env 解析: url=${KUGOU_URL} quality=${KUGOU_QUALITY} library=${LIBRARY_DIR}" >> "$LOGF"
+
+# 写到临时文件再原子替换：避免"重定向先截断"把上面读到的值吃掉。
+ENV_TMP="${ENV_FILE}.tmp.$$"
+{
+    echo "FNMUSIC_KUGOU_ENABLED=${KUGOU_ENABLED}"
+    echo "FNMUSIC_KUGOU_URL=${KUGOU_URL}"
+    echo "FNMUSIC_KUGOU_QUALITY=${KUGOU_QUALITY}"
+    echo "FNMUSIC_KUGOU_SEARCH_TIMEOUT=${KUGOU_TIMEOUT}"
+    echo "FNMUSIC_KUGOU_TOKEN=${TOKEN}"
+    echo "FNMUSIC_KUGOU_USERID=${USERID}"
+    echo "FNMUSIC_KUGOU_DFID=${DFID}"
+    echo "FNMUSIC_KUGOU_T1=${T1}"
+    echo "FNMUSIC_KUGOU_MID=${MID}"
+    echo "FNMUSIC_KUGOU_GUID=${GUID}"
+    echo "FNMUSIC_KUGOU_DEV=${DEV}"
+    echo "FNMUSIC_KUGOU_MAC=${MACV}"
+    echo "FNMUSIC_LIBRARY_DIR=${LIBRARY_DIR}"
+    echo "FNMUSIC_SAVE_ENABLED=${SAVE_ENABLED}"
+    echo "FNMUSIC_SAVE_DIR=${SAVE_DIR}"
+    echo "FNMUSIC_SAVE_WRITE_TAGS=${SAVE_TAGS}"
+    echo "FNMUSIC_SAVE_WRITE_COVER=${SAVE_COVER}"
+    echo "FNMUSIC_SAVE_WRITE_LYRIC=${SAVE_LYRIC}"
+    echo "FNMUSIC_SAVE_MARKER_DIR=${SAVE_MARKER}"
+    echo "FNMUSIC_SAVE_MAX_BYTES=${SAVE_MAX_BYTES}"
+    echo "FNMUSIC_SAVE_TIMEOUT_S=${SAVE_TIMEOUT}"
+    echo "FNMUSIC_FAV_DIR=${FAV_DIR}"
+} > "$ENV_TMP" || { echo "[install_callback] FAIL: 写 .env" >> "$LOGF"; rm -f "$ENV_TMP"; exit 1; }
+# 曾为 666，而 .env 里存酷狗 token：同机任何用户/容器都能读走。改 600。
+chmod 600 "$ENV_TMP" 2>/dev/null || true
+mv -f "$ENV_TMP" "$ENV_FILE" 2>/dev/null || { echo "[install_callback] FAIL: 替换 .env" >> "$LOGF"; rm -f "$ENV_TMP"; exit 1; }
+chmod 600 "$ENV_FILE" 2>/dev/null || true
+echo "[install_callback] .env 写好 -> $ENV_FILE" >> "$LOGF"
+
+# 1.0.0 分叉起不再清理"安装目录里的旧 .env"——那条路径已不存在。
+# （原逻辑存在的意义是防"包内空模板下次升级又盖掉凭证"，而本分支的
+#  app.tgz 不含 .env，且无迁移义务，见上方注释。）
+
+chmod +x "$APP_DIR/proxy/run_proxy.sh" 2>/dev/null || true
+
+echo "[install_callback] END OK @ $(date)" >> "$LOGF"
+exit 0

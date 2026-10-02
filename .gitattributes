@@ -1,0 +1,38 @@
+# 统一换行符：脚本一律 LF
+#
+# 背景：本项目的 cmd/* 是**在飞牛的 Linux 上以 root 运行**的启动/安装脚本。
+# 若在 Windows 上编辑后以 CRLF 落盘，`#!/bin/bash` 会带上 \r，
+# 内核找不到解释器 → 脚本静默不执行，表现为"应用装上了但起不来"。
+# 这类故障排查成本极高，故在此**强制**脚本类文件用 LF。
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.bash    text eol=lf
+
+# 无扩展名的 cmd/* 与 config/* 也是 shell 脚本，必须 LF
+cmd/*     text eol=lf
+config/*  text eol=lf
+wizard/*  text eol=lf
+
+*.py      text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.json    text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.js      text eol=lf
+
+# 二进制：禁止任何换行转换与差异比较
+*.fpk     binary
+*.tgz     binary
+*.gz      binary
+*.PNG     binary
+*.png     binary
+*.ico     binary
+*.pyc     binary
+*.woff2   binary
+
+# 压缩包/图片在 diff 里不展开
+*.fpk     -diff
+*.tgz     -diff
+*.PNG     -diff

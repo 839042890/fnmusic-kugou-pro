@@ -1,0 +1,15 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+# Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+# fnmusic-pro cmd/stop_callback
+# 极简：只做 kill
+PID_FILE="/tmp/fnmusic-pro.pid"
+if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE")"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    rm -f "$PID_FILE"
+fi
+exit 0

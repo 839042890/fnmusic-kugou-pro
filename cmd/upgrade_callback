@@ -1,0 +1,57 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
+# Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
+# fnmusic-pro cmd/upgrade_callback
+#
+# 一件事：语法检查（不阻断）。
+#
+# ── 1.0.0 分叉说明（为什么这个文件变得这么短）────────────────────────
+# 上游的 upgrade_callback 干两件事：
+#   1) 把 .env 从安装目录迁移到配置目录
+#   2) 迁移在线收藏（app/home/online_favorites -> 持久 home）
+#
+# 这两条在**本分支已全部删除**，理由：
+#   · 本分支以 fnmusic_ext_kugou **2.1.0** 为基线。2.1.0 的 .env 本就
+#     存放在配置目录 /vol1/@appconf/<app>/.env —— 不存在"安装目录里有
+#     旧 .env"这种历史状态（那是 2.1.1~2.1.2 自迭代期间的中间态）。
+#   · 按基线原则，自迭代期间产生的状态**没有迁移义务**；保留迁移代码
+#     只会让人误以为还有旧数据需要救援，增加误判风险。
+#   · 分叉后应用名变为 fnmusic_kugou_pro，配置目录也随之变为
+#     /vol1/@appconf/fnmusic_kugou_pro —— 即便有旧数据，也是另一个应用
+#     的目录，不属于本分支该管的事。
+#
+# ⚠ 打包铁律（与本文件相关，改打包内容时必守）：
+#    app.tgz **绝不能包含 .env**。飞牛覆盖安装是"先解包、后 callback"，
+#    若包里带一份 .env 模板，它会在回调有机会做任何事之前就盖掉用户
+#    的登录凭证。回归测试里有断言（见 tests/test_rebrand.py）。
+
+APPDEST="${TRIM_APPDEST:-}"
+[ -n "$APPDEST" ] || exit 0
+
+APP_DIR="$APPDEST/app"
+if [ ! -f "$APP_DIR/proxy/app.py" ] && [ -f "$APPDEST/proxy/app.py" ]; then
+    APP_DIR="$APPDEST"
+fi
+
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/fnmusic-pro-upgrade.log}"
+log() { echo "[upgrade_callback] $*" >> "$LOG" 2>/dev/null || true; }
+
+log "BEGIN @ $(date)"
+
+# ===== 语法检查（不阻断升级）=====
+VENV_PY="$APPDEST/.venv-proxy/bin/python3"
+if [ ! -x "$VENV_PY" ] && [ -x "$APP_DIR/.venv-proxy/bin/python3" ]; then
+    VENV_PY="$APP_DIR/.venv-proxy/bin/python3"
+fi
+
+if [ -x "$VENV_PY" ]; then
+    "$VENV_PY" -m py_compile \
+        "$APP_DIR/proxy/app.py" \
+        "$APP_DIR/proxy/kugou_source.py" \
+        "$APP_DIR/proxy/app_socket_bridge.py" 2>/dev/null \
+        && log "py_compile OK" || log "WARN py_compile 有告警"
+fi
+
+log "END OK @ $(date)"
+exit 0
