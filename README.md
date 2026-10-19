@@ -9,7 +9,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86-green.svg)]()
-![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+![Version](https://img.shields.io/badge/version-1.0.1-orange.svg)
 
 ---
 
@@ -116,6 +116,7 @@ Unix socket，把酷狗音源接进了【音乐】App，思路非常巧妙。
 |---|---|
 | 配置 / 登录令牌 | `/vol1/@appconf/fnmusic_kugou_pro` |
 | 运行缓存 | `/vol1/@appdata/fnmusic_kugou_pro` |
+| 运行状态（PID / 日志 / 安装目录记录） | `/vol1/@appdata/fnmusic_kugou_pro`（1.0.1 起；此前在 `/tmp`） |
 | 在线收藏 | `/vol1/@apphome/fnmusic_kugou_pro` |
 | **归档去重索引** | **`<落盘目录>/.fnmusic_save_index/`** |
 
@@ -302,11 +303,14 @@ docker run -d --name kugou-api -p 4000:3000 <kugou-api-image>
 
 | 版本 | 要点 |
 |---|---|
+| **1.0.1** | 缺陷修复：状态文件迁出 `/tmp`（误判「已关闭」/ 孤儿进程）、判活三级兜底、`stop` 杀干净、测试与真机 `.env` 隔离 |
 | **1.0.0** | 独立分叉首发：3 个安全漏洞修复 / 边播边存重写 / 持久化目录迁移 / 应用图标修复 / 10+ 遗留 Bug |
 
 > 本项目的版本号**独立计数**，不继承上游序列。
-> **`1.0.0` 是本项目第一个公开发布版本**；此前开发中的 `1.0.1` / `1.0.2`
-> 从未对外发布，内容已全部并入 `1.0.0`。
+> **`1.0.0` 是本项目第一个公开发布版本**；此前开发中的两次内部构建
+> （曾用 `1.0.1` / `1.0.2` 作构建号）从未对外发布，内容已全部并入 `1.0.0`。
+> ⚠️ 本表中 **`1.0.1`（2026-10-19）与那两次内部构建无关**，它是 1.0.0 之后
+> 真正对外发布的第一个补丁版本。
 
 **版本谱系：**
 
@@ -403,12 +407,12 @@ bash tools/build.sh          # 产出 out/fnmusic_kugou_pro-<版本>.fpk
 的哈希都应当一致。你可以自己验证：
 
 ```bash
-bash tools/build.sh && md5sum out/fnmusic_kugou_pro-1.0.0/*.fpk out/fnmusic_kugou_pro-1.0.0/*-src.zip
+bash tools/build.sh && md5sum out/fnmusic_kugou_pro-1.0.1/*.fpk out/fnmusic_kugou_pro-1.0.1/*-src.zip
 # 换个 umask / 换个时区再来一次，两次哈希必须相同
-(umask 077 && TZ=UTC bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-1.0.0/*.fpk out/fnmusic_kugou_pro-1.0.0/*-src.zip
+(umask 077 && TZ=UTC bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-1.0.1/*.fpk out/fnmusic_kugou_pro-1.0.1/*-src.zip
 ```
 
-产物会组装在 `out/fnmusic_kugou_pro-1.0.0/`，含 `checksums.txt`
+产物会组装在 `out/fnmusic_kugou_pro-1.0.1/`，含 `checksums.txt`
 （发帖用）与 `SHA256SUMS` / `MD5SUMS`（机器校验用，`sha256sum -c SHA256SUMS`）。
 
 为此构建脚本钉死了**四样**东西，缺一样就会漂移（都是真实踩过的坑）：

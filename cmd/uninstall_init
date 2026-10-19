@@ -9,15 +9,32 @@ TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 
 # 停本扩展进程
-PID_FILE="/tmp/fnmusic-pro.pid"
-if [ -f "$PID_FILE" ]; then
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ]; then
-        kill "$pid" 2>/dev/null || true
-        sleep 2
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+# P-01：PID 文件可能已被清掉（旧版把它放 /tmp），这里按 /proc cmdline
+# 兜底认领，避免卸载后留下孤儿进程继续占着 socket。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if . "${SCRIPT_DIR}/_proxy_state.sh" 2>/dev/null; then
+    STATE_DIR="$(fnmusic_state_dir)"
+    APP_DIR="$(fnmusic_app_dir "$STATE_DIR" || true)"
+    if [ -n "$APP_DIR" ]; then
+        APP_DIR_REAL="$(readlink -f "$APP_DIR" 2>/dev/null || printf '%s' "$APP_DIR")"
+        fnmusic_kill_all "$APP_DIR_REAL" \
+            "${STATE_DIR}/${FNMUSIC_STATE_PID_NAME}" \
+            "/tmp/${FNMUSIC_STATE_PID_NAME}"
+    else
+        rm -f "${STATE_DIR}/${FNMUSIC_STATE_PID_NAME}" "/tmp/${FNMUSIC_STATE_PID_NAME}"
     fi
-    rm -f "$PID_FILE"
+else
+    # 共享脚本缺失（包不完整）时退回到旧行为，别让卸载流程直接卡死
+    PID_FILE="/tmp/fnmusic-pro.pid"
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
 fi
 
 # 检查 TARGET 是否是代理占的 socket（通过 healthz 判断）

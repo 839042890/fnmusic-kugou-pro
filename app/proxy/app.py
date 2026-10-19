@@ -115,7 +115,23 @@ _VAR_DIR = _pkg_dir("TRIM_PKGVAR", "var", _HOME, alias_key="FNMUSIC_VAR_DIR")
 _PKG_HOME_DIR = _pkg_dir("TRIM_PKGHOME", "home", _HOME, alias_key="FNMUSIC_PKG_HOME_DIR")
 
 # .env 位置：**只有配置目录**（1.0.0 分叉起不再回退安装目录，见 resolve_env_file）
-_ENV_FILE = Path(_ETC_DIR) / ".env"
+#
+# 例外：显式给了 `FNMUSIC_ENV_FILE`（绝对路径）就以它为准。
+# 为什么需要这个口子（P-02）：真机上跑测试时，本模块会加载
+# /vol1/@appconf/<app>/.env 并把测试自己设的 FNMUSIC_SAVE_WRITE_TAGS 之类
+# 覆盖成 0，于是 6 项测试"假红"（干净环境全绿）—— 误导排查方向。
+# 测试只要把它指到一个临时文件，就与真机配置彻底隔离。
+# 只接受绝对路径：相对路径的含义取决于进程 cwd，太容易被意外命中。
+_ENV_FILE_ENV_KEY = "FNMUSIC_ENV_FILE"
+_ENV_FILE_EXPLICIT = str(os.environ.get(_ENV_FILE_ENV_KEY) or "").strip()
+if _ENV_FILE_EXPLICIT and not os.path.isabs(_ENV_FILE_EXPLICIT):
+    logger.warning("%s=%s 不是绝对路径，忽略", _ENV_FILE_ENV_KEY, _ENV_FILE_EXPLICIT)
+    _ENV_FILE_EXPLICIT = ""
+_ENV_FILE = (
+    Path(_ENV_FILE_EXPLICIT)
+    if _ENV_FILE_EXPLICIT
+    else Path(_ETC_DIR) / ".env"
+)
 
 
 # ===== 环境变量读取（空值 == 未设置）=====
@@ -769,6 +785,9 @@ import kugou_source  # noqa: E402
 # ===== 启动时从 .env 加载持久化凭证（若存在则优先于环境变量）=====
 def resolve_env_file(create: bool = False) -> Path:
     """返回 .env 的读写路径：**配置目录**（/vol1/@appconf/<app>/.env）。
+
+    若设置了 `FNMUSIC_ENV_FILE`（绝对路径），则以它为准 —— 读与写（设置页保存、
+    扫码登录回写）都走这一个函数，所以覆盖点只有一处，不会出现"读一个、写另一个"。
 
     1.0.0 分叉起这里不再有"安装目录旧 .env"的回退分支。依据：本分支以
     fnmusic_ext_kugou **2.1.0** 为基线，2.1.0 起 .env 就在配置目录，
@@ -5060,6 +5079,10 @@ async def ext_healthz(request: Request):
         "ok": upstream_status == "ok" and source_ok,
         "upstream": upstream_status,
         "kugou": kugou_status,
+        # 应用名只用于"自己人认自己"：cmd/main 判活时会拿它确认 socket 上
+        # 跑的是本应用而不是别的音源扩展（上游扩展的 healthz 也有 upstream/
+        # kugou 两个键，光看那两个会认错人）。纯新增字段，前端不依赖它。
+        "app": _APP_NAME,
     }
 
 

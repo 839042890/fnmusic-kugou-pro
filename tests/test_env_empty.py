@@ -138,6 +138,10 @@ print("@@OK@@")
 env = {k: v for k, v in os.environ.items() if not k.startswith("FNMUSIC_")}
 env.update(EMPTY_ENV)
 env["_T_PROXY"] = str(PROXY)
+# P-02：本用例要验证的是"安装脚本产出的空值 .env 长什么样"，
+# 真机上 /vol1/@appconf/<app>/.env 一旦存在，app.py 导入期就会读它并覆盖
+# EMPTY_ENV —— 测的就不是这里构造的形状了。钉到不存在的文件。
+env["FNMUSIC_ENV_FILE"] = str(Path(tempfile.mkdtemp(prefix="fnmusic-env-")) / "absent.env")
 env.pop("PYTHONPATH", None)
 
 proc = subprocess.run(

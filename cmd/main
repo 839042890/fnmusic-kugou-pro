@@ -5,12 +5,34 @@
 # fnmusic-pro cmd/main
 # 进程管理 + 停止时还原 socket
 
-LOG="/tmp/fnmusic-pro-main.log"
-PID_FILE="/tmp/fnmusic-pro.pid"
-RUN_LOG="/tmp/fnmusic-pro-run.log"
-APPDEST_FILE="/tmp/fnmusic-pro-appdest"
+# ===== 共享状态工具 =====
+# 状态目录 / 判活 / 按 cmdline 找回与清理进程，四个入口（main、stop_callback、
+# uninstall_init、uninstall_callback）共用同一份实现。理由见该文件头注释。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! . "${SCRIPT_DIR}/_proxy_state.sh"; then
+    echo "缺少 ${SCRIPT_DIR}/_proxy_state.sh（包不完整？）" >&2
+    exit 1
+fi
 
-mkdir -p /tmp 2>/dev/null || true
+# ===== 状态文件：一律放持久目录 =====
+# 1.0.0 把它们放在 /tmp。两个真实后果（P-01）：
+#   ① /tmp 被清理（重启、或任何清理脚本删 fnmusic*）之后，应用中心读不到
+#      PID → 判「已关闭」，而进程其实还在服务（状态显示与实际不符）；
+#   ② 此时 stop 也读不到 PID → 杀不掉旧进程 → 它变成孤儿，与新实例
+#      同时挂同一个 socket，白占内存。
+# 现在落 TRIM_PKGVAR（@appdata），并保留 /tmp 的**只读**兼容（升级后第一次
+# 启动还能读到旧记录）。写新文件时显式 chmod：本平台新建文件权限 = 父目录
+# 权限，umask 不参与。
+STATE_DIR="$(fnmusic_state_dir)"
+mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR="/tmp"
+LOG="${STATE_DIR}/${FNMUSIC_STATE_LOG_NAME}"
+PID_FILE="${STATE_DIR}/${FNMUSIC_STATE_PID_NAME}"
+RUN_LOG="${STATE_DIR}/${FNMUSIC_STATE_RUNLOG_NAME}"
+APPDEST_FILE="${STATE_DIR}/${FNMUSIC_STATE_APPDEST_NAME}"
+# 1.0.0 及更早的位置（只读兼容，不再写）
+LEGACY_PID_FILE="/tmp/${FNMUSIC_STATE_PID_NAME}"
+LEGACY_APPDEST_FILE="/tmp/${FNMUSIC_STATE_APPDEST_NAME}"
+
 log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }
 
 ACTION="${1:-}"
@@ -20,19 +42,30 @@ APPDEST="${TRIM_APPDEST:-}"
 if [ -z "$APPDEST" ] && [ -f "$APPDEST_FILE" ]; then
     APPDEST="$(cat "$APPDEST_FILE" 2>/dev/null)"
 fi
+if [ -z "$APPDEST" ] && [ -f "$LEGACY_APPDEST_FILE" ]; then
+    APPDEST="$(cat "$LEGACY_APPDEST_FILE" 2>/dev/null)"
+    log "APPDEST 取自旧位置 ${LEGACY_APPDEST_FILE}"
+fi
 [ -n "$APPDEST" ] || { log "APPDEST 未注入"; exit 1; }
 
-APP_DIR="$APPDEST/app"
-if [ ! -x "$APP_DIR/proxy/run_proxy.sh" ] && [ -x "$APPDEST/proxy/run_proxy.sh" ]; then
-    APP_DIR="$APPDEST"
+# 把安装目录记到持久状态目录：stop_callback / uninstall_init 未必拿得到
+# TRIM_APPDEST，而"按 cmdline 认领进程"必须先知道安装目录。
+# （1.0.0 定义了 APPDEST_FILE 却从来没写过 —— 这行就是补那个洞。）
+if [ "$(cat "$APPDEST_FILE" 2>/dev/null || true)" != "$APPDEST" ]; then
+    if printf '%s\n' "$APPDEST" > "$APPDEST_FILE" 2>/dev/null; then
+        chmod 600 "$APPDEST_FILE" 2>/dev/null || true
+    fi
 fi
-if [ ! -x "$APP_DIR/proxy/run_proxy.sh" ] && [ -x "$APPDEST/app/proxy/run_proxy.sh" ]; then
-    APP_DIR="$APPDEST/app"
-fi
-if [ ! -x "$APP_DIR/proxy/run_proxy.sh" ]; then
-    log "未找到 run_proxy.sh（APP_DIR=$APP_DIR）"
+
+# 安装目录解析走共享实现（与 stop_callback / uninstall_init 同一份逻辑，
+# 免得"main 认得的路径"和"stop_callback 认得的路径"哪天不一致）
+if ! APP_DIR="$(fnmusic_app_dir "$STATE_DIR")"; then
+    log "未找到 run_proxy.sh（APPDEST=$APPDEST）"
     exit 1
 fi
+# 归一成真实路径再拿去比对 /proc 的 cmdline（APP_DIR 可能是 /var/apps/<app>/target
+# 这类符号链接，而进程里记的是 /vol1/@appcenter/<app>）。
+APP_DIR_REAL="$(readlink -f "$APP_DIR" 2>/dev/null || printf '%s' "$APP_DIR")"
 
 APP_SOCK="$APP_DIR/fnmusic_kugou_pro.sock"
 
@@ -67,11 +100,19 @@ export TRIM_PKGHOME="$(resolve_pkg_dir TRIM_PKGHOME "${PKG_META_DIR}/home" "${AP
 mkdir -p "$TRIM_PKGETC" "$TRIM_PKGVAR" "$TRIM_PKGHOME" 2>/dev/null || true
 
 is_running() {
-    [ -f "$PID_FILE" ] || return 1
-    local pid
-    pid="$(cat "$PID_FILE" 2>/dev/null || echo "")"
-    [ -n "$pid" ] || return 1
-    kill -0 "$pid" 2>/dev/null
+    # 三级兜底（实现在 _proxy_state.sh）：
+    #   ① PID 文件 —— 带 /proc cmdline 校验，防"PID 被复用"时误报（并防止
+    #      stop 时把无关进程杀掉）；
+    #   ② /proc 扫盘 —— PID 文件被清掉也能把进程找回来，并回写 PID 文件；
+    #   ③ healthz 指纹 —— 连进程都扫不到时的最后一道（要求响应里带本应用名）。
+    if fnmusic_is_running "$APP_DIR_REAL" "$PID_FILE"; then
+        if [ "${FNMUSIC_LAST_SOURCE:-pidfile}" != "pidfile" ]; then
+            log "判活命中兜底（来源=${FNMUSIC_LAST_SOURCE} PID=${FNMUSIC_LAST_PID:-?}）：" \
+                "PID 文件缺失或失效，已回写 $PID_FILE"
+        fi
+        return 0
+    fi
+    return 1
 }
 
 # 检查 socket 类型：unix socket / regular file / 不存在
@@ -160,7 +201,7 @@ log "==== $ACTION (whoami=$(id -un)) APPDEST=$APPDEST ===="
 case "$ACTION" in
     start)
         if is_running; then
-            log "已在运行 (PID=$(cat "$PID_FILE"))"
+            log "已在运行 (PID=${FNMUSIC_LAST_PID:-$(fnmusic_pid_file_read "$PID_FILE" || echo '?')})"
             exit 0
         fi
         rm -f "$PID_FILE" 2>/dev/null || true
@@ -201,8 +242,14 @@ case "$ACTION" in
         log "启动网关桥接器 PID=$bridge_pid"
 
         sleep 5
-        if is_running; then
-            log "代理存活 PID=$local_pid"
+        # 判活以 $local_pid 为准（与 1.0.0 一致）：run_proxy.sh 还在预检时
+        # cmdline 仍是 ./proxy/run_proxy.sh，不能拿"扫不到 uvicorn"当死亡。
+        if kill -0 "$local_pid" 2>/dev/null; then
+            if fnmusic_pid_is_ours "$local_pid" "$APP_DIR_REAL"; then
+                log "代理存活 PID=$local_pid（cmdline 已确认为本应用）"
+            else
+                log "代理存活 PID=$local_pid（cmdline 暂未确认，可能仍在预检）"
+            fi
         else
             log "代理进程死亡。run.log 尾部："
             tail -30 "$RUN_LOG" 2>&1 >> "$LOG" || true
@@ -215,6 +262,12 @@ case "$ACTION" in
             restore_socket
             exit 1
         fi
+        # 网关 socket 通常晚几秒才出现（run_proxy 要先等到 trim-music 就绪）。
+        # 1.0.0 只看一眼就判失败，等于把"还在等上游"当成"没起来"。
+        for _i in $(seq 1 10); do
+            sock_is_unix "$APP_SOCK" && break
+            sleep 1
+        done
         if sock_is_unix "$APP_SOCK"; then
             log "网关 socket 存活: $APP_SOCK"
             exit 0
@@ -224,22 +277,24 @@ case "$ACTION" in
         exit 1
         ;;
     stop)
-        if is_running; then
-            pid="$(cat "$PID_FILE")"
-            kill "$pid" 2>/dev/null || true
-            sleep 2
-            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
-            rm -f "$PID_FILE"
-            log "已停止代理进程"
-        else
-            log "代理未在运行"
-        fi
-        pkill -f "[p]roxy/app_socket_bridge.py" 2>/dev/null || true
-        sleep 1
-        pkill -9 -f "[p]roxy/app_socket_bridge.py" 2>/dev/null || true
+        # 杀干净：PID 文件 + /proc 扫盘 + 网关桥接器。
+        # 只靠 PID 文件的老做法在"PID 文件被清掉"时什么都杀不到，旧进程会
+        # 变成孤儿并与新实例抢同一个 socket —— 这正是 P-01 的第 2 条影响。
+        _scanned="$(fnmusic_find_pids "$APP_DIR_REAL" | tr '\n' ' ')"
+        log "stop 前：PID 文件=$(fnmusic_pid_file_read "$PID_FILE" || echo 空)" \
+            "扫盘到=[${_scanned% }]"
+        fnmusic_kill_all "$APP_DIR_REAL" "$PID_FILE" "$LEGACY_PID_FILE"
+        log "已停止代理进程（含兜底清理）"
         rm -f "$APP_SOCK" 2>/dev/null || true
         restore_socket
         exit 0
+        ;;
+    status)
+        # 只写"兜底命中"这一类日志（见 is_running），正常轮询不产生噪音。
+        if is_running; then
+            exit 0
+        fi
+        exit 3
         ;;
     status)
         if is_running; then

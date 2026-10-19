@@ -62,6 +62,9 @@ os.environ.update({
     "FNMUSIC_ETC_DIR": str(ROOT / "fnmusic_kugou_pro" / "etc"),
     "FNMUSIC_VAR_DIR": str(ROOT / "fnmusic_kugou_pro" / "var"),
     "FNMUSIC_PKG_HOME_DIR": str(ROOT / "fnmusic_kugou_pro" / "home"),
+    # P-02：把 .env 钉到不存在的文件。真机 /vol1/@appconf/<app>/.env 存在时，
+    # app.py 导入期会读它并覆盖上面设的变量 → 测试在真机"假红"。
+    "FNMUSIC_ENV_FILE": str(ROOT / "absent.env"),
     "TRIM_PKGETC": "", "TRIM_PKGVAR": "", "TRIM_PKGHOME": "",
 })
 for _p in ("etc", "var", "home"):

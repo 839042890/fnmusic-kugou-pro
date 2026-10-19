@@ -50,6 +50,10 @@ os.environ.update({
     "FNMUSIC_CACHE_DIR": str(ROOT / "cache"),
     "FNMUSIC_HOME_DIR": str(ROOT / "home"),
     "FNMUSIC_KUGOU_ENABLED": "0",
+    # P-02：显式把 .env 指到不存在的文件。真机上有
+    # /vol1/@appconf/<app>/.env，app.py 导入时会读它并覆盖上面这些变量，
+    # 于是测试在真机"假红"、在干净环境全绿。
+    "FNMUSIC_ENV_FILE": str(ROOT / "absent.env"),
 })
 # 关键：不设置 FNMUSIC_SAVE_MARKER_DIR，走"留空自动推导"的新默认
 os.environ.pop("FNMUSIC_SAVE_MARKER_DIR", None)

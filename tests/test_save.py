@@ -53,6 +53,9 @@ os.environ.update({
     "FNMUSIC_PKG_HOME_DIR": str(ROOT / "fnmusic_kugou_pro" / "home"),
     # 宿主可能注入 TRIM_PKGETC 等（调用方应用的上下文，可能指向别的应用），
     # 清掉以免盖过上面的临时目录。
+    # P-02：把 .env 钉到不存在的文件。真机 /vol1/@appconf/<app>/.env 存在时，
+    # app.py 导入期会读它并覆盖上面设的变量 → 测试在真机"假红"。
+    "FNMUSIC_ENV_FILE": str(ROOT / "absent.env"),
     "TRIM_PKGETC": "", "TRIM_PKGVAR": "", "TRIM_PKGHOME": "",
 })
 for _p in ("etc", "var", "home"):

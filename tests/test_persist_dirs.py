@@ -71,6 +71,8 @@ def resolve(extra_env: dict[str, str]) -> tuple[dict, str]:
         # 先把宿主可能注入的值清干净，再由 extra_env 决定
         "TRIM_PKGETC": "", "TRIM_PKGVAR": "", "TRIM_PKGHOME": "",
         "FNMUSIC_ETC_DIR": "", "FNMUSIC_VAR_DIR": "", "FNMUSIC_PKG_HOME_DIR": "",
+        # P-02：显式 .env 覆盖也必须清掉，否则真机设过它会改写下面的 env_file 断言
+        "FNMUSIC_ENV_FILE": "",
     })
     env.update(extra_env)
     r = subprocess.run([PY, "-c", RESOLVE_CHILD], capture_output=True, text=True, env=env)
@@ -279,6 +281,8 @@ def child_env(etc: Path, var: Path, home: Path, inst: Path) -> dict[str, str]:
         # 别让宿主注入的值漏进来（app.py 会优先认它们）
         "TRIM_PKGETC": "", "TRIM_PKGVAR": "", "TRIM_PKGHOME": "",
         "FNMUSIC_ETC_DIR": "", "FNMUSIC_VAR_DIR": "", "FNMUSIC_PKG_HOME_DIR": "",
+        # P-02：显式 .env 覆盖也必须清掉，否则真机设过它会改写下面的 env_file 断言
+        "FNMUSIC_ENV_FILE": "",
     })
     env.update({
         "FNMUSIC_ETC_DIR": str(etc), "FNMUSIC_VAR_DIR": str(var),

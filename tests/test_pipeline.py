@@ -59,6 +59,9 @@ os.environ.update({
     "FNMUSIC_HOME_DIR": str(ROOT / "home"),
     "FNMUSIC_KUGOU_ENABLED": "1",
     "FNMUSIC_APP_MODE": "",
+    # P-02：真机上有 /vol1/@appconf/<app>/.env，app.py 导入期会读它并覆盖
+    # 上面这些变量（写标签/封面/歌词被压成 0）→ 6 项"假红"。钉到不存在的文件。
+    "FNMUSIC_ENV_FILE": str(ROOT / "absent.env"),
 })
 
 sys.path.insert(0, str(PROXY))

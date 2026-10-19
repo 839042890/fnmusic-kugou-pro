@@ -3,13 +3,35 @@
 # Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
 # Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
 # fnmusic-pro cmd/stop_callback
-# 极简：只做 kill
-PID_FILE="/tmp/fnmusic-pro.pid"
-if [ -f "$PID_FILE" ]; then
-    pid="$(cat "$PID_FILE")"
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
-    sleep 1
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-    rm -f "$PID_FILE"
+# 极简：只做 kill（socket 还原是 stop 主流程 / 卸载流程的职责，这里不改语义）
+#
+# P-01：进程定位不再只看 PID 文件。PID 文件被清掉时（/tmp 被清理），
+# 老逻辑什么都杀不到 —— 旧进程变孤儿、与新实例共用一个 socket。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! . "${SCRIPT_DIR}/_proxy_state.sh"; then
+    exit 0
+fi
+
+STATE_DIR="$(fnmusic_state_dir)"
+PID_FILE="${STATE_DIR}/${FNMUSIC_STATE_PID_NAME}"
+LEGACY_PID_FILE="/tmp/${FNMUSIC_STATE_PID_NAME}"
+
+APP_DIR="$(fnmusic_app_dir "$STATE_DIR" || true)"
+if [ -n "$APP_DIR" ]; then
+    APP_DIR_REAL="$(readlink -f "$APP_DIR" 2>/dev/null || printf '%s' "$APP_DIR")"
+    fnmusic_kill_all "$APP_DIR_REAL" "$PID_FILE" "$LEGACY_PID_FILE"
+else
+    # 连安装目录都定位不到（异常安装）：退回到"只信 PID 文件"，
+    # 至少不会漏掉最普通的那条路径。
+    for _f in "$PID_FILE" "$LEGACY_PID_FILE"; do
+        _pid="$(fnmusic_pid_file_read "$_f" || true)"
+        if [ -n "$_pid" ]; then
+            kill "$_pid" 2>/dev/null || true
+            sleep 1
+            kill -0 "$_pid" 2>/dev/null && kill -9 "$_pid" 2>/dev/null || true
+        fi
+        rm -f "$_f"
+    done
+    pkill -f "[p]roxy/app_socket_bridge.py" 2>/dev/null || true
 fi
 exit 0

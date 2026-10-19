@@ -3,6 +3,24 @@
 # Copyright (C) 2026 ai2ku (https://github.com/ai2ku/)
 # Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
 # fnmusic-pro cmd/uninstall_callback
-# 卸载后清理 /tmp 状态
+# 卸载后清理状态文件（持久目录 + 旧版 /tmp 位置都要清）
+#
+# 只删"进程状态"文件（PID / 日志 / appdest 记录）；缓存与去重索引在
+# TRIM_PKGVAR 里，属于用户数据，卸载不主动删（与飞牛"卸载不删 @appconf/
+# @appdata"的惯例一致，重装后还能接着用）。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR=""
+if . "${SCRIPT_DIR}/_proxy_state.sh" 2>/dev/null; then
+    STATE_DIR="$(fnmusic_state_dir)"
+    if [ -n "$STATE_DIR" ]; then
+        rm -f "${STATE_DIR}/${FNMUSIC_STATE_PID_NAME}" \
+              "${STATE_DIR}/${FNMUSIC_STATE_APPDEST_NAME}" \
+              "${STATE_DIR}/${FNMUSIC_STATE_LOG_NAME}" \
+              "${STATE_DIR}/${FNMUSIC_STATE_RUNLOG_NAME}" 2>/dev/null
+        rm -f "${STATE_DIR}/${FNMUSIC_STATE_LOG_NAME}".* \
+              "${STATE_DIR}/${FNMUSIC_STATE_RUNLOG_NAME}".* 2>/dev/null
+    fi
+fi
+# 旧版（1.0.0 及更早）位置
 rm -f /tmp/fnmusic-pro.pid /tmp/fnmusic-pro-appdest /tmp/fnmusic-pro-*.log 2>/dev/null
 exit 0
