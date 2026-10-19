@@ -51,7 +51,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 SCRIPT = REPO / "tools" / "make_src_zip.py"
-PREFIX = "fnmusic_kugou_pro-1.0.0/"
+APP_NAME = "fnmusic_kugou_pro"
+
+# 版本号**从 manifest 读**，不要写死。
+# 踩过：1.0.1 打包后本测试仍用 "1.0.0/" 作前缀去重新生成，
+# 于是交付物与"验证值"永远不相等 —— 假失败，而且看起来像打包坏了。
+VERSION = ""
+_mf = REPO / "manifest"
+if _mf.is_file():
+    for _ln in _mf.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if _ln.strip().startswith("version"):
+            VERSION = _ln.split("=", 1)[1].strip()
+            break
+if not VERSION:
+    print("FAIL：读不到 manifest 里的 version")
+    sys.exit(1)
+PREFIX = f"{APP_NAME}-{VERSION}/"
 
 TZS = ["UTC", "Asia/Shanghai", "America/New_York", "Pacific/Kiritimati"]
 
@@ -151,15 +166,17 @@ print("\n[D] 交付物与已验证物必须是同一个东西")
 # 只有 [A] 证明"脚本稳定"，还不足以说明**要交给用户的那个文件**也是稳定的
 # —— 万一 out/ 里躺着的是上次用旧脚本生成的残留，[A] 照样全绿。
 # 所以要显式比对交付目录里的那份。
-_delivered = sorted((REPO / "out").glob("*/fnmusic_kugou_pro-*-src.zip"))
-if not _delivered:
-    print("      （out/ 下还没生成 src.zip，跳过 —— 先跑一次 tools/build.sh）")
+# 只看**当前版本**那一份。out/ 里可能还躺着旧版本的目录，
+# 它们的 prefix 不同（版本号不同），本来就不该与本轮验证同哈希 ——
+# 把旧版本也算进来只会得到一条与"可复现性"无关的假失败。
+_delivered = REPO / "out" / f"{APP_NAME}-{VERSION}" / f"{APP_NAME}-{VERSION}-src.zip"
+if not _delivered.is_file():
+    print(f"      （{_delivered} 不存在，跳过 —— 先跑一次 tools/build.sh）")
 else:
-    for _d in _delivered:
-        _dh = hashlib.md5(_d.read_bytes()).hexdigest()
-        check(f"交付的 {_d.name} 与四时区验证结果一致",
-              _dh == script_hashes[TZS[0]],
-              f"交付={_dh} 验证={script_hashes[TZS[0]]}")
+    _dh = hashlib.md5(_delivered.read_bytes()).hexdigest()
+    check(f"交付的 {_delivered.name} 与四时区验证结果一致",
+          _dh == script_hashes[TZS[0]],
+          f"交付={_dh} 验证={script_hashes[TZS[0]]}")
 
 shutil.rmtree(work, ignore_errors=True)
 
