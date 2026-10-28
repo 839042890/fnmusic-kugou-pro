@@ -5294,6 +5294,56 @@ async def ext_healthz(request: Request):
     }
 
 
+@app.get("/_ext/playlist_map")
+async def ext_playlist_map(request: Request):
+    """歌单映射自检：配置是否生效、当前用户命中哪条规则。
+
+    只读诊断。**不返回 Authorization、不返回 token、不返回缓存哈希**；
+    guid 只给前 8 位（它是用户标识，不是凭据，但没必要全给）。
+    """
+    path = playlist_map_path()
+    try:
+        exists = os.path.exists(path)
+        raw_size = os.path.getsize(path) if exists else 0
+    except OSError:
+        exists, raw_size = False, 0
+    cfg = load_playlist_map()
+
+    def _brief(rule: dict) -> dict:
+        return {"mode": rule.get("mode"), "ids": sorted(rule.get("ids") or [])}
+
+    users = {k: _brief(v) for k, v in (cfg.get("users") or {}).items()}
+    default = _brief(cfg.get("default") or {"mode": "all", "ids": frozenset()})
+
+    user_guid, user_name = "", ""
+    try:
+        user_guid, user_name = await resolve_playlist_user(request, get_upstream_client(request.app))
+    except Exception as e:
+        logger.debug("playlist_map 自检：用户探测失败 %s", e)
+
+    rule, hit = playlist_rule_for(user_guid, user_name)
+    return {
+        "active": bool(users),
+        "file": path,
+        "exists": exists,
+        "bytes": raw_size,
+        "users": users,
+        "default": default,
+        "current": {
+            "user": user_name or None,
+            "guid": (user_guid[:8] + "…") if user_guid else None,
+            "matched": hit,
+            "mode": rule.get("mode"),
+        },
+    }
+
+
+@app.get("/app/fnmusic_kugou_pro/_ext/playlist_map")
+async def ext_playlist_map_gateway(request: Request):
+    # 网关前缀别名：与 healthz / settings 一样两条路由指同一个实现
+    return await ext_playlist_map(request)
+
+
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):
@@ -7582,6 +7632,304 @@ async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> t
         return True, "shared", None
 
 
+# ===================== 歌单可见性（F-03） =====================
+# 背景：底层是同一个酷狗账号，飞牛多个本地用户看到的却是同一批歌单。
+# F-03 按「飞牛本地用户」过滤「我的歌单」。
+#
+# 设计要点（评审定过的，别改）：
+#   1. 配置独立成 playlist_map.json，不塞 .env（JSON 塞进 KEY=VALUE 会互相踩）
+#   2. 权限 0640 root:AppUsers —— 里面只有歌单 ID，不敏感，且要让复核方读得到
+#   3. 判定顺序 用户名 → guid → default（飞牛允许改用户名，只认名字迟早失效）
+#   4. 配置为空 = 不过滤，且**不触发任何上游请求**（零影响 + 零开销快路径）
+#   5. JSON 损坏时**保留上次有效配置**（既不全放行也不全拦截）
+#   6. 被屏蔽时返回**同构空数据**（不是 404、不是 null），别让播放器报错
+
+_PLAYLIST_MAP_FILENAME = "playlist_map.json"
+_PLAYLIST_MODES = ("whitelist", "blacklist", "all")
+def _pm_empty() -> dict:
+    """每次返回全新结构。别用模块级常量 dict(_X) 浅拷 —— users 会被共享，
+    谁改了空配置的 users 就污染了"空"的定义。"""
+    return {"users": {}, "default": {"mode": "all", "ids": frozenset()}}
+# mtime 热加载缓存：checked 是"上次 stat 的时刻"，1 秒内不重复 stat（省 syscall）
+_PM_CACHE: dict = {"mtime": None, "data": None, "checked": 0.0}
+_PM_STAT_TTL = 1.0
+
+
+def playlist_map_path() -> str:
+    """与 .env 同目录 —— 都在 @appconf/<app>/，随配置目录一起被备份/迁移。"""
+    return str(_ENV_FILE.parent / _PLAYLIST_MAP_FILENAME)
+
+
+def _pm_norm_rule(raw: Any, where: str) -> dict | None:
+    """校验单条规则。返回 None = 该条无效（跳过它，其余配置照常生效）。"""
+    if not isinstance(raw, dict):
+        logger.warning("[PLAYLIST_MAP] %s 不是对象，忽略该项", where)
+        return None
+    mode = str(raw.get("mode") or "all").strip().lower()
+    if mode not in _PLAYLIST_MODES:
+        logger.warning("[PLAYLIST_MAP] %s 的 mode=%r 非法（只接受 %s），忽略该项",
+                       where, mode, "/".join(_PLAYLIST_MODES))
+        return None
+    ids: set[str] = set()
+    ids_raw = raw.get("ids")
+    if ids_raw is not None:
+        if not isinstance(ids_raw, list):
+            logger.warning("[PLAYLIST_MAP] %s 的 ids 不是数组，按空处理", where)
+        else:
+            for x in ids_raw:
+                s = str(x).strip()   # global_collection_id 是字符串、listid 是数字，混用必踩
+                if s:
+                    ids.add(s)
+    if mode == "whitelist" and not ids:
+        # 配了 whitelist 却忘写 ids：按"配置无效"处理（放行）。
+        # 不能静默屏蔽全部 —— 那会让用户以为"歌单全没了"却查不出原因。
+        logger.warning("[PLAYLIST_MAP] %s 的 mode=whitelist 但 ids 为空，按无效配置处理（不过滤）",
+                       where)
+        return None
+    # blacklist + 空 ids = 什么都不屏蔽。这是**有效**配置（等价 all），
+    # 不能判无效回落 default —— 那样会让"我不想屏蔽任何东西"的人被 default 管住。
+    return {"mode": mode, "ids": frozenset(ids)}
+
+
+def _pm_normalize(raw: Any) -> dict | None:
+    """归一成 {"users": {key: rule}, "default": rule}。
+    返回 None = 结构整体不可用（调用方保留上次有效配置）。"""
+    if not isinstance(raw, dict):
+        logger.warning("[PLAYLIST_MAP] 顶层不是对象，配置不可用")
+        return None
+    users_raw = raw.get("users", {})
+    if users_raw is None:
+        users_raw = {}
+    if not isinstance(users_raw, dict):
+        logger.warning("[PLAYLIST_MAP] users 不是对象，配置不可用")
+        return None
+    users: dict[str, dict] = {}
+    for k, v in users_raw.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        rule = _pm_norm_rule(v, f"users[{key}]")
+        if rule is not None:
+            users[key] = rule
+    default = _pm_norm_rule(raw.get("default") or {"mode": "all"}, "default") \
+        or {"mode": "all", "ids": frozenset()}
+    return {"users": users, "default": default}
+
+
+def load_playlist_map() -> dict:
+    """读 playlist_map.json，按 mtime 热加载。
+
+    损坏（语法错 / 结构不可用）时**保留上次有效配置**；首次就损坏 ⇒ 空配置（= 不过滤），
+    因为那时没有任何"上次有效"可退。
+    """
+    path = playlist_map_path()
+    now = time.time()
+    if _PM_CACHE["data"] is not None and now - float(_PM_CACHE["checked"] or 0) < _PM_STAT_TTL:
+        return _PM_CACHE["data"]
+    _PM_CACHE["checked"] = now
+
+    try:
+        st = os.stat(path)
+    except OSError:
+        if (_PM_CACHE["data"] or {}).get("users"):
+            logger.warning("[PLAYLIST_MAP] %s 已消失，沿用上次有效配置（%d 条规则）",
+                           path, len(_PM_CACHE["data"]["users"]))
+        _PM_CACHE["mtime"] = None
+        _PM_CACHE["data"] = _pm_empty()
+        return _PM_CACHE["data"]
+
+    if _PM_CACHE["mtime"] == st.st_mtime_ns and _PM_CACHE["data"] is not None:
+        return _PM_CACHE["data"]
+
+    def _keep_last(reason: str) -> dict:
+        logger.warning("[PLAYLIST_MAP] %s：%s；沿用上次有效配置", path, reason)
+        # 记住本次 mtime，避免同一个坏文件被每个请求重复解析+刷日志
+        _PM_CACHE["mtime"] = st.st_mtime_ns
+        if _PM_CACHE["data"] is None:
+            _PM_CACHE["data"] = _pm_empty()
+        return _PM_CACHE["data"]
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        return _keep_last(f"解析失败（{e}）")
+
+    norm = _pm_normalize(raw)
+    if norm is None:
+        return _keep_last("结构不可用")
+
+    _PM_CACHE["mtime"] = st.st_mtime_ns
+    _PM_CACHE["data"] = norm
+    logger.info("[PLAYLIST_MAP] 已加载 %d 条用户规则（default=%s）",
+                len(norm["users"]), norm["default"]["mode"])
+    return norm
+
+
+def playlist_map_active() -> bool:
+    """有没有任何会改变结果的规则。False ⇒ 所有入口走原有逻辑，零额外请求。
+
+    注意不能只看 users：**只配 default（不配 users）也是有效配置**，
+    这时所有用户都该受 default 约束。早期只判 users 会让 default 静默失效。
+    """
+    cfg = load_playlist_map()
+    if cfg.get("users"):
+        return True
+    default = cfg.get("default") or {}
+    return default.get("mode", "all") != "all"
+
+
+_GUID_NAME_CACHE: dict = {"ts": 0.0, "map": {}}
+_GUID_NAME_TTL = 60.0
+
+
+def _user_table_map() -> dict[str, str]:
+    """music.db 的 user 表：guid → 用户名。读不到返回空（调用方回退用 guid 当键）。"""
+    now = time.time()
+    if now - float(_GUID_NAME_CACHE["ts"] or 0) < _GUID_NAME_TTL:
+        return _GUID_NAME_CACHE["map"]
+    out: dict[str, str] = {}
+    db = str(CONF.get("music_db") or "")
+    if db and os.path.exists(db):
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                # 列名不硬编码：飞牛升级可能改 schema。guid 列是唯一必须的。
+                # 名字列**按优先级排成一组**一起读，取第一个非空值 —— 只挑"存在的
+                # 那一列"不够：某些版本 name 存在但留空，实际显示名在 name_latin_full。
+                cols = [str(d[1]) for d in con.execute("PRAGMA table_info(user)").fetchall()]
+                if not cols:
+                    raise RuntimeError("user 表不存在")
+                low = {c.lower(): c for c in cols}
+                guid_col = low.get("guid")
+                name_cols = [
+                    low[k] for k in (
+                        "name", "username", "nickname", "displayname", "nick",
+                        "name_latin_full",     # name 为空时的兜底
+                        "name_latin",
+                    )
+                    if k in low
+                ]
+                if not guid_col or not name_cols:
+                    raise RuntimeError(f"user 表列名不符预期（有 {cols}）")
+                sel = ", ".join([guid_col] + name_cols)
+                rows = con.execute(f"SELECT {sel} FROM user").fetchall()
+            finally:
+                con.close()
+            for row in rows:
+                g = str(row[0] or "").strip()
+                if not g:
+                    continue
+                for v in row[1:]:
+                    nm = str(v or "").strip()
+                    if nm:
+                        out[g] = nm
+                        break
+        except Exception as e:
+            # 读库失败不能让整个功能挂掉 —— 只是匹配退化到 guid
+            logger.warning("[PLAYLIST_MAP] 读 music.db user 表失败（退化用 guid 当键）：%s", e)
+    _GUID_NAME_CACHE["ts"] = now
+    _GUID_NAME_CACHE["map"] = out
+    return out
+
+
+_UC_CACHE: dict[str, tuple[str, str, float]] = {}
+_UC_TTL = 300.0        # 命中后 5 分钟
+_UC_TTL_NEG = 60.0     # 未登录也缓存，别让扫描/后台任务每次都打 /user/me
+_UC_MAX = 128
+
+
+def _auth_fingerprint(request: Request) -> str:
+    """仅作内存缓存键。**绝不写进日志**（里面含 token 片段）。"""
+    parts = []
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in ("authorization", "cookie", "x-trim-music-temp-token"):
+            parts.append(f"{lk}={v}")
+    if not parts:
+        c = getattr(request, "client", None)
+        parts.append(f"peer={getattr(c, 'host', '') if c else ''}")
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+async def resolve_playlist_user(request: Request, client: httpx.AsyncClient) -> tuple[str, str]:
+    """返回 (飞牛用户 guid, 用户名)。未登录 / 探测失败 ⇒ ("", "")，由调用方走 default。"""
+    key = _auth_fingerprint(request)
+    now = time.time()
+    hit = _UC_CACHE.get(key)
+    if hit and hit[2] > now:
+        return hit[0], hit[1]
+    try:
+        is_authed, guid, _auth_resp = await _probe_upstream_auth(request, client)
+    except Exception as e:
+        logger.warning("[PLAYLIST_MAP] 用户探测异常（按未登录处理）：%s", e)
+        is_authed, guid = False, ""
+    if not is_authed or not guid or guid == "shared":
+        _UC_CACHE[key] = ("", "", now + _UC_TTL_NEG)
+        return "", ""
+    name = _user_table_map().get(guid, "")
+    _UC_CACHE[key] = (guid, name, now + _UC_TTL)
+    if len(_UC_CACHE) > _UC_MAX:
+        for k in [k for k, v in _UC_CACHE.items() if v[2] <= now]:
+            _UC_CACHE.pop(k, None)
+        if len(_UC_CACHE) > _UC_MAX:
+            _UC_CACHE.clear()
+    return guid, name
+
+
+def playlist_rule_for(guid: str, name: str) -> tuple[dict, str]:
+    """按 用户名 → guid → default 取规则，返回 (rule, 命中标识)。"""
+    cfg = load_playlist_map()
+    users = cfg.get("users") or {}
+    if name and name in users:
+        return users[name], f"user:{name}"
+    if guid and guid in users:
+        return users[guid], f"guid:{guid[:8]}…"
+    return cfg.get("default") or {"mode": "all", "ids": frozenset()}, "default"
+
+
+def playlist_allow(rule: dict, playlist_id: str) -> bool:
+    mode = rule.get("mode", "all")
+    ids = rule.get("ids") or frozenset()
+    pid = str(playlist_id or "").strip()
+    if mode == "whitelist":
+        return pid in ids
+    if mode == "blacklist":
+        return pid not in ids
+    return True
+
+
+def filter_playlist_bundles(bundles: list[dict], guid: str, name: str) -> list[dict]:
+    """只过滤酷狗来源的歌单（injected）；官方本地歌单不经过这里。顺序不变。"""
+    if not playlist_map_active():
+        return bundles
+    rule, hit = playlist_rule_for(guid, name)
+    if rule.get("mode", "all") == "all":
+        return bundles
+    kept: list[dict] = []
+    dropped: list[str] = []
+    for b in bundles:
+        pid = kugou_playlist_id_from_guid(str(b.get("guid") or ""))
+        if playlist_allow(rule, pid):
+            kept.append(b)
+        else:
+            dropped.append(pid)
+    if dropped:
+        # 这行是以后排查的唯一线索，别删
+        logger.info("[PLAYLIST_MAP] filtered %d/%d rule=%s mode=%s drop=%s",
+                    len(dropped), len(bundles), hit, rule.get("mode"), ",".join(dropped[:6]))
+    return kept
+
+
+def playlist_blocked_detail_payload() -> dict:
+    """被屏蔽歌单的 detail 响应：**与正常响应同构**，只把 data 置空。
+
+    不用 404、不用 null —— 播放器拿到 null/404 会弹错，拿到 {} 只是"空歌单"。
+    ⚠️ 最终形状已按真机实测确定，改动前先看 README「歌单映射」一节。
+    """
+    return {"code": 0, "msg": "ok", "data": {}}
+
+
 @app.post("/music/api/v1/favorite-track/create")
 async def favorite_track_create(request: Request):
     if not _is_get_request(request):
@@ -8042,11 +8390,31 @@ async def playlist_list(request: Request):
     upstream_client = get_upstream_client(request.app)
 
     # 1. 先加载酷狗用户歌单（不依赖上游）
+    #    F-03：配了规则才识别用户；没配就走原来的单请求路径（零额外开销）。
     kugou_playlists = []
-    try:
-        kugou_playlists = await fetch_kugou_user_playlist_bundles()
-    except Exception as e:
-        logger.warning("[KUGOU_PLAYLIST] list inject failed: %s", e)
+    if playlist_map_active():
+        # 并发：拉歌单 + 识别用户，两步互不依赖
+        bundle_res, user_res = await asyncio.gather(
+            fetch_kugou_user_playlist_bundles(),
+            resolve_playlist_user(request, upstream_client),
+            return_exceptions=True,   # 任一失败都不许连累另一个
+        )
+        if isinstance(bundle_res, BaseException):
+            logger.warning("[KUGOU_PLAYLIST] list inject failed: %s", bundle_res)
+            kugou_playlists = []
+        else:
+            kugou_playlists = bundle_res or []
+        if isinstance(user_res, BaseException):
+            logger.warning("[PLAYLIST_MAP] 识别用户失败，按 default 处理：%s", user_res)
+            user_guid, user_name = "", ""
+        else:
+            user_guid, user_name = user_res
+        kugou_playlists = filter_playlist_bundles(kugou_playlists, user_guid, user_name)
+    else:
+        try:
+            kugou_playlists = await fetch_kugou_user_playlist_bundles()
+        except Exception as e:
+            logger.warning("[KUGOU_PLAYLIST] list inject failed: %s", e)
 
     now_ts = int(time.time())
     injected = [
@@ -8112,6 +8480,17 @@ async def playlist_detail(request: Request):
     if not is_kugou_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
+    # F-03：被屏蔽的歌单必须在这里就拦住。放行的话下面会走 bundles 匹配 /
+    # 回源酷狗 detail 分支，等于没拦。
+    if playlist_map_active():
+        user_guid, user_name = await resolve_playlist_user(request, get_upstream_client(request.app))
+        rule, hit = playlist_rule_for(user_guid, user_name)
+        pid = kugou_playlist_id_from_guid(guid)
+        if not playlist_allow(rule, pid):
+            logger.info("[PLAYLIST_MAP] detail blocked pid=%s rule=%s mode=%s",
+                        pid, hit, rule.get("mode"))
+            return JSONResponse(content=playlist_blocked_detail_payload())
+
     # 酷狗歌单：从酷狗列表中找到对应条目
     try:
         bundles = await fetch_kugou_user_playlist_bundles()
@@ -8148,6 +8527,20 @@ async def playlist_batch_detail(request: Request):
     kugou_ids = [g for g in guids if is_kugou_playlist_guid(g)]
     if not kugou_ids:
         return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    # F-03：先剔除当前用户看不到的歌单 —— 后面的 bundles 匹配与"回源酷狗 detail"
+    # 都只针对剩下的。过滤后可能为空，此时只会返回 official_list，符合预期。
+    if playlist_map_active():
+        user_guid, user_name = await resolve_playlist_user(request, get_upstream_client(request.app))
+        rule, hit = playlist_rule_for(user_guid, user_name)
+        before = len(kugou_ids)
+        kugou_ids = [
+            g for g in kugou_ids
+            if playlist_allow(rule, kugou_playlist_id_from_guid(g))
+        ]
+        if len(kugou_ids) != before:
+            logger.info("[PLAYLIST_MAP] batch-detail filtered %d/%d rule=%s mode=%s",
+                        before - len(kugou_ids), before, hit, rule.get("mode"))
 
     upstream_client = get_upstream_client(request.app)
     rest = [g for g in guids if not is_kugou_playlist_guid(g)]
@@ -8216,6 +8609,16 @@ async def playlist_track_list(request: Request):
     ).strip()
     if not is_kugou_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
+
+    # F-03：整张歌单的歌都从这个接口出。不拦的话 size=-1 一次就能拉完被屏蔽歌单。
+    if playlist_map_active():
+        user_guid, user_name = await resolve_playlist_user(request, get_upstream_client(request.app))
+        rule, hit = playlist_rule_for(user_guid, user_name)
+        pid = kugou_playlist_id_from_guid(guid)
+        if not playlist_allow(rule, pid):
+            logger.info("[PLAYLIST_MAP] track-list blocked pid=%s rule=%s mode=%s",
+                        pid, hit, rule.get("mode"))
+            return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": [], "total": 0}})
 
     try:
         page = max(int(request.query_params.get("page") or 1), 1)

@@ -9,7 +9,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86-green.svg)]()
-![Version](https://img.shields.io/badge/version-1.0.3-orange.svg)
+![Version](https://img.shields.io/badge/version-1.0.4-orange.svg)
 
 ---
 
@@ -170,6 +170,10 @@ Unix socket，把酷狗音源接进了【音乐】App，思路非常巧妙。
 - ⚠️ **设置接口没有自带鉴权**，依赖上游 nginx 兜底。
   （上述配置与权限问题**已加固**，但权限模型未变。）
 - ⚠️ 桌面入口 **`allUsers: true`**，socket 权限 **0666**。
+- ⚠️ **歌单映射的用户名匹配依赖 root 身份**：`guid → 用户名` 要读飞牛
+  `music.db` 的 `user` 表，而该目录是 `drwx------ root:root`（只有 root 能读）。
+  当前以 root 运行所以可用；**若将来改成非 root 运行，这条会静默退化**成
+  「只用 guid 匹配」（配置里写用户名的规则失效，不会报错）。
 
 > **⇒ 请勿在多人共用且互不信任的 NAS 上裸装本应用。**
 
@@ -293,6 +297,79 @@ docker run -d --name kugou-api -p 4000:3000 <kugou-api-image>
 sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 ```
 
+### 歌单映射：让不同飞牛用户看到不同的「我的歌单」
+
+> **不需要就不用管这一节。** 这个文件不存在时，所有用户看到同一批酷狗歌单（即原来的行为）。
+
+这个扩展底下只挂**一个**酷狗账号。如果同一个 NAS 上有多个人各自登录飞牛、
+却共用这一个酷狗账号，那每个人打开「我的歌单」都会看到账号主人的全部歌单。
+`playlist_map.json` 用来按**飞牛用户**给酷狗歌单分个可见范围。
+
+**位置**（权限 `0660 root:AppUsers`，只有歌单 ID，不含任何凭据）：
+
+```
+/vol1/@appconf/fnmusic_kugou_pro/playlist_map.json
+```
+
+> 属组写权限是有意给的：里面只有歌单 ID，不含凭据，让 NAS 上的普通账号
+> （比如跑自动化/管理脚本的那个）能直接改，省得每次 `sudo`。
+
+**结构**：
+
+```json
+{
+  "users": {
+    "alice":  { "mode": "whitelist", "ids": ["collection_1_1700000000_1_0"] },
+    "bob":    { "mode": "blacklist", "ids": ["collection_2_1700000000_1_0"] },
+    "7f3c9a1e-2b44-4f0d-9c88-1a2b3c4d5e6f": { "mode": "all" }
+  },
+  "default": { "mode": "blacklist", "ids": ["collection_2_1700000000_1_0"] }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `users` 的键 | **飞牛用户名**优先；也可以写飞牛用户的 `guid`（用户名改了才会用到它） |
+| `mode` | `whitelist` 只显示 `ids` 里的；`blacklist` 隐藏 `ids` 里的；`all` 全部显示 |
+| `ids` | 酷狗**歌单 ID**，既不是歌单名也不是完整 guid。从 `online:kugou:playlist:<这里>` 中间那段取 |
+| `default` | 没匹配到任何用户时用这条；不写等于 `{"mode":"all"}` |
+
+**怎么查歌单 ID**：扩展日志（`<安装目录>/log/proxy.log`）里
+`[PLAYLIST_MAP] filtered ... drop=...` 与歌单请求的 guid 都带 ID；也可以打开
+开发者工具看 `playlist/list` 返回里的 `guid` 字段，取最后一个冒号之后那段。
+
+**生效方式**：改完保存即可 —— 按文件修改时间**热加载，最长 1 秒生效，不用重启**。
+
+**被屏蔽时是什么表现**（三处一致，都是「空」而不是「报错」）：
+
+| 接口 | 被屏蔽时的响应 |
+|---|---|
+| `playlist/list` | 该歌单**不出现在列表里**（其余歌单正常） |
+| `playlist/detail` | `{"code":0,"msg":"ok","data":{}}` |
+| `track/playlist-detail/list` | `{"code":0,"msg":"ok","data":{"list":[],"total":0}}` |
+
+刻意不用 404 / `null`：播放器拿到它们会弹错误提示，拿到空数据只是显示「空歌单」。
+
+**写错了怎么办**：JSON 语法错或结构不对时，扩展会**保留上一次能用的配置**并打一条
+`[PLAYLIST_MAP] ... 沿用上次有效配置`，既不会突然全放行、也不会突然全屏蔽。
+如果从没成功加载过（第一次写就是坏的），则按「不过滤」运行。
+
+**自检**：在内网浏览器打开
+`http://<你的NAS>:<端口>/app/fnmusic_kugou_pro/_ext/playlist_map`，
+能看到当前生效的规则、以及**你自己**命中哪一条：
+
+> 🔒 这个端点**仅限内网访问**：它不校验登录、不返回凭据，但也别把它暴露到公网
+> （会告诉访问者有哪些用户名与歌单 ID）。
+
+```json
+{"active":true,"file":"/vol1/@appconf/fnmusic_kugou_pro/playlist_map.json",
+ "users":{"alice":{"mode":"whitelist","ids":["collection_1_1700000000_1_0"]}},
+ "default":{"mode":"blacklist","ids":["collection_2_1700000000_1_0"]},
+ "current":{"user":"alice","guid":"7f3c9a1e…","matched":"user:alice","mode":"whitelist"}}
+```
+
+> ⚠️ 过滤只作用于**酷狗来源的歌单**。飞牛本地曲库里的歌单、以及「收藏」不受影响。
+
 ---
 
 ## 常见问题
@@ -318,6 +395,7 @@ sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 
 | 版本 | 要点 |
 |---|---|
+| **1.0.4** | 新增 **F-03 歌单映射**：同一个酷狗账号，多个飞牛用户各看各的歌单（whitelist / blacklist / all，用户名 → guid → default）；4 个入口统一拦截；被屏蔽返回同构空数据而非 404；`playlist_map.json` 热加载、无需重启；另修「只配 default 时功能静默失效」 |
 | **1.0.3** | P-05 残留修复：升级时不再被平台回放的旧表单值覆盖配置；新增 `FNMUSIC_ADOPT_WIZARD=1` 逃生口；`KEEP` 提示改为写进安装输出 |
 | **1.0.2** | P-05 安装/覆盖安装不再冲掉用户 `.env`；F-02 本地优先播放；HTTP Range 语义统一（越界 416）；音乐接口占用检测重写 |
 | **1.0.1** | 缺陷修复：状态文件迁出 `/tmp`（误判「已关闭」/ 孤儿进程）、判活三级兜底、`stop` 杀干净、测试与真机 `.env` 隔离 |
@@ -325,7 +403,7 @@ sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 
 > 本项目的版本号**独立计数**，不继承上游序列。
 > **`1.0.0` 是本项目第一个公开发布版本**，此后依次发布
-> `1.0.1`（2026-10-19）、`1.0.2`（2026-10-28）、`1.0.3`（2026-10-28）。
+> `1.0.1`（2026-10-19）、`1.0.2`（2026-10-28）、`1.0.3`（2026-10-28）、`1.0.4`（2026-10-28）。
 > ⚠️ 编号有个历史坑：`1.0.0` 之前开发中的两次内部构建**也曾借用 `1.0.1` / `1.0.2`
 > 这两个号**，从未对外发布、内容已并入 `1.0.0`。所以在旧材料里看到「1.0.1」「1.0.2」，
 > 有可能指的是那两次内部构建 —— **判断新旧请以日期和上表为准**。
