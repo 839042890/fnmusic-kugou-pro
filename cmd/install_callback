@@ -11,6 +11,17 @@ if [ -z "$LOGF" ]; then
 fi
 mkdir -p "$(dirname "$LOGF")" 2>/dev/null || true
 
+# 日志双写：$LOGF + stderr。
+#   stderr 会被飞牛应用中心捕获、显示在安装输出里 —— 用户点「安装」时
+#   **当场看得见**。只写 $LOGF 的话，用户永远不知道"我在配置页改了，为什么没生效"。
+# ⚠ 绝不能写 stdout：_env_take / env_scalar / env_flag 的返回值**就是 stdout**
+#   （调用方写的是 KUGOU_URL="$(env_scalar ...)"），往 stdout 打日志会把配置值
+#   污染成「提示语 + 真值」。所以这里固定走 >&2。
+note() {
+    echo "[install_callback] $*" >> "$LOGF" 2>/dev/null
+    echo "[install_callback] $*" >&2
+}
+
 echo "[install_callback] START whoami=$(id -un) @ $(date)" >> "$LOGF"
 
 APPDEST="$TRIM_APPDEST"
@@ -294,23 +305,45 @@ _env_take() {
     fi
 
     if [ "$_has" = "1" ]; then
-        # —— .env 里已经有这个键：默认不覆盖 ——
+        # —— .env 里已经有这个键 ——
+        #
+        # ① 逃生口：显式要求采用向导值。默认关闭，正常升级/重装走不到这里。
+        #    用途：确实想用应用中心「配置」页改 URL/音质的人。
+        #      sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk xxx.fpk
+        #    ⚠ 必须先判 $_wiz 非空 —— 否则"开了逃生口但向导没传这个字段"会把
+        #      用户配置写成一串空值（比覆盖更糟）。
+        if [ "${FNMUSIC_ADOPT_WIZARD:-0}" = "1" ] && [ -n "$_wiz" ]; then
+            note "ADOPT ${_key}: 已显式要求采用向导值(${_wiz})，覆盖原值(${_cur})"
+            printf '%s' "$(env_clean "$_wiz")"
+            return 0
+        fi
+        # ② 向导没传这个字段 ⇒ 保留现值
         if [ -z "$_wiz" ]; then
             if [ -z "$_cur" ] && [ "$_kind" = "flag" ]; then
-                echo "[install_callback] WARN ${_key} 在 .env 中存在但值为空，按原样保留（不回落到默认 ${_default}）" >> "$LOGF"
+                note "WARN ${_key} 在 .env 中存在但值为空，按原样保留（不回落到默认 ${_default}）"
             fi
             printf '%s' "$(env_clean "$_cur")"
             return 0
         fi
-        if [ "$_wiz" = "$_def" ]; then
-            # 向导值恰好等于 initValue ⇒ 用户没在向导里改过它，保留现有配置
-            echo "[install_callback] KEEP ${_key}: 向导值是默认值(${_def})，保留已有配置(${_cur})" >> "$LOGF"
-            printf '%s' "$(env_clean "$_cur")"
-            return 0
+        # ③ 其余情况：一律保留现有值。
+        #
+        # ⚠ 不能用「向导值 != initValue ⇒ 用户主动改过」来判定。飞牛在升级/重装时
+        # 会把**上次提交的表单值**原样回放给 install_callback；老用户的值与新包的
+        # initValue 天然不相等，会被误判成"用户在向导里改了"，从而静默覆盖用户配置。
+        # （1.0.2 真机升级实测：QUALITY 从 high 被回放成 128，音质静默降级。）
+        #
+        # 判错的两种代价不对称：
+        #   · "设置页改过"被误当成"向导改过" → 用户设置被静默回滚（不可接受）
+        #   · "配置页改过"被忽略 → 用户当场看到下面这条提示，且设置页仍能改
+        # 故一律选"保留"，并给一个显式逃生口（见 ①）。
+        #
+        # 只在「向导值既不同于现值、也不同于本版默认值」时才提示 —— 那是**唯一**
+        # 能说明"用户可能真的在配置页动过"的情形；回放默认值时提示纯属噪音，
+        # 每次升级都刷一遍反而让真正的信号被忽略。
+        if [ "$_wiz" != "$_cur" ] && [ "$_wiz" != "$_def" ]; then
+            note "KEEP ${_key}: 已有配置优先，忽略向导值(${_wiz})（本版默认 ${_def}），保留(${_cur})；如需修改请用扩展设置页（或用 FNMUSIC_ADOPT_WIZARD=1 重装以强制采用向导值）"
         fi
-        # 向导值不同于 initValue ⇒ 用户主动改了，采用
-        echo "[install_callback] USE ${_key}: 向导值(${_wiz}) 不同于默认值(${_def})，按用户输入覆盖原值(${_cur})" >> "$LOGF"
-        printf '%s' "$(env_clean "$_wiz")"
+        printf '%s' "$(env_clean "$_cur")"
         return 0
     fi
 

@@ -9,7 +9,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86-green.svg)]()
-![Version](https://img.shields.io/badge/version-1.0.1-orange.svg)
+![Version](https://img.shields.io/badge/version-1.0.3-orange.svg)
 
 ---
 
@@ -278,6 +278,21 @@ docker run -d --name kugou-api -p 4000:3000 <kugou-api-image>
 
 > 也支持 `/var/apps/fnmusic_kugou_pro/etc/` 符号链接访问（指向同一位置）。
 
+### 在哪里改配置（重要）
+
+> **改 URL / 音质 / 各项开关，请用扩展设置页（应用中心 → 本应用 → 打开 → 设置）。**
+
+应用中心「配置」页对**已安装**的应用不生效：飞牛会把**上次安装时提交的表单值**
+回放给安装脚本，脚本无法把它和「用户这次真的改了」区分开。为了避免静默覆盖你
+已经调好的配置，安装脚本一律**保留 `.env` 里的现值**，并在安装输出里打印
+`KEEP <键>: 已有配置优先，忽略向导值(...)` 说明它忽略了哪个向导值。
+
+确实想用配置页强制覆盖时，走显式逃生口：
+
+```bash
+sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
+```
+
 ---
 
 ## 常见问题
@@ -303,14 +318,17 @@ docker run -d --name kugou-api -p 4000:3000 <kugou-api-image>
 
 | 版本 | 要点 |
 |---|---|
+| **1.0.3** | P-05 残留修复：升级时不再被平台回放的旧表单值覆盖配置；新增 `FNMUSIC_ADOPT_WIZARD=1` 逃生口；`KEEP` 提示改为写进安装输出 |
+| **1.0.2** | P-05 安装/覆盖安装不再冲掉用户 `.env`；F-02 本地优先播放；HTTP Range 语义统一（越界 416）；音乐接口占用检测重写 |
 | **1.0.1** | 缺陷修复：状态文件迁出 `/tmp`（误判「已关闭」/ 孤儿进程）、判活三级兜底、`stop` 杀干净、测试与真机 `.env` 隔离 |
 | **1.0.0** | 独立分叉首发：3 个安全漏洞修复 / 边播边存重写 / 持久化目录迁移 / 应用图标修复 / 10+ 遗留 Bug |
 
 > 本项目的版本号**独立计数**，不继承上游序列。
-> **`1.0.0` 是本项目第一个公开发布版本**；此前开发中的两次内部构建
-> （曾用 `1.0.1` / `1.0.2` 作构建号）从未对外发布，内容已全部并入 `1.0.0`。
-> ⚠️ 本表中 **`1.0.1`（2026-10-19）与那两次内部构建无关**，它是 1.0.0 之后
-> 真正对外发布的第一个补丁版本。
+> **`1.0.0` 是本项目第一个公开发布版本**，此后依次发布
+> `1.0.1`（2026-10-19）、`1.0.2`（2026-10-28）、`1.0.3`（2026-10-28）。
+> ⚠️ 编号有个历史坑：`1.0.0` 之前开发中的两次内部构建**也曾借用 `1.0.1` / `1.0.2`
+> 这两个号**，从未对外发布、内容已并入 `1.0.0`。所以在旧材料里看到「1.0.1」「1.0.2」，
+> 有可能指的是那两次内部构建 —— **判断新旧请以日期和上表为准**。
 
 **版本谱系：**
 
@@ -407,12 +425,12 @@ bash tools/build.sh          # 产出 out/fnmusic_kugou_pro-<版本>.fpk
 的哈希都应当一致。你可以自己验证：
 
 ```bash
-bash tools/build.sh && md5sum out/fnmusic_kugou_pro-1.0.1/*.fpk out/fnmusic_kugou_pro-1.0.1/*-src.zip
+bash tools/build.sh && md5sum out/fnmusic_kugou_pro-*/*.fpk out/fnmusic_kugou_pro-*/*-src.zip
 # 换个 umask / 换个时区再来一次，两次哈希必须相同
-(umask 077 && TZ=UTC bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-1.0.1/*.fpk out/fnmusic_kugou_pro-1.0.1/*-src.zip
+(umask 077 && TZ=UTC bash tools/build.sh) && md5sum out/fnmusic_kugou_pro-*/*.fpk out/fnmusic_kugou_pro-*/*-src.zip
 ```
 
-产物会组装在 `out/fnmusic_kugou_pro-1.0.1/`，含 `checksums.txt`
+产物会组装在 `out/fnmusic_kugou_pro-<版本>/`，含 `checksums.txt`
 （发帖用）与 `SHA256SUMS` / `MD5SUMS`（机器校验用，`sha256sum -c SHA256SUMS`）。
 
 为此构建脚本钉死了**四样**东西，缺一样就会漂移（都是真实踩过的坑）：

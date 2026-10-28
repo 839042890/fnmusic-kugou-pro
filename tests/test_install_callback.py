@@ -281,7 +281,90 @@ printf '%s\\n' "$(pick_pkg_dir TRIM_PKGETC /nonexistent/pkg/{APP}/etc /fallback)
         got = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
         check(desc, got == want, f"得到 {got!r}，期望 {want!r}")
 
-    for obj in (L, L2, L4):
+    # ---------------------------------------------------------------- 5
+    print()
+    print("=" * 70)
+    print("5) P-05 残留：平台回放旧表单值，绝不能覆盖用户已有配置")
+    print("=" * 70)
+    # 真实事故（1.0.2 真机升级到 1.0.2 时）：飞牛把**上次安装提交的表单值**
+    # 原样回放给 install_callback。用户 .env 里是 high，回放值是 128
+    # （1.0.1 时代留下的旧输入），而新包的 initValue 已经是 high ——
+    # 旧逻辑「向导值 != initValue ⇒ 用户主动改过 ⇒ USE 向导值」于是把
+    # 用户的 high 静默覆盖成 128，音质降级且无任何提示。
+    #
+    # 判据改为：.env 里**已有该键就一律保留**，向导值只在键不存在时生效。
+    # 另给一个显式逃生口 FNMUSIC_ADOPT_WIZARD=1。
+
+    def seed_and_run(wizard: dict[str, str], pre: dict[str, str] | None):
+        """造一个"已有 .env"的布局（或空布局），带指定向导环境变量跑一遍。"""
+        lay = Layout("fnmusic-replay-")
+        if pre:
+            lay.env_file.write_text(
+                "".join(f"{k}={v}\n" for k, v in pre.items()), encoding="utf-8")
+            lay.env_file.chmod(0o600)
+        # 从外部 shell 继承来的 FNMUSIC_ADOPT_WIZARD 会干扰用例，显式钉死默认值
+        wiz = {"FNMUSIC_ADOPT_WIZARD": "0"}
+        wiz.update(wizard)
+        return lay, run_install(lay, wiz)
+
+    seeded = {
+        "FNMUSIC_KUGOU_QUALITY": "high",
+        "FNMUSIC_KUGOU_URL": "http://127.0.0.1:4000",
+        "FNMUSIC_KUGOU_TOKEN": "TOKEN-保留我",
+        "FNMUSIC_SAVE_WRITE_TAGS": "0",
+    }
+
+    # ① 平台回放旧表单值 ⇒ 一律保留（这就是那次事故的回归测试）
+    L5, r5 = seed_and_run({"FNMUSIC_KUGOU_QUALITY": "128"}, seeded)
+    e5 = read_env(L5)
+    check("回放旧表单值：退出码 0", r5.returncode == 0, f"{r5.returncode} {r5.stderr[-300:]}")
+    check("回放旧表单值：音质仍是 high（事故回归）",
+          e5.get("FNMUSIC_KUGOU_QUALITY") == "high", repr(e5.get("FNMUSIC_KUGOU_QUALITY")))
+    check("回放旧表单值：URL 仍是用户配的 4000",
+          e5.get("FNMUSIC_KUGOU_URL") == "http://127.0.0.1:4000",
+          repr(e5.get("FNMUSIC_KUGOU_URL")))
+    check("回放旧表单值：token 未丢",
+          e5.get("FNMUSIC_KUGOU_TOKEN") == "TOKEN-保留我", repr(e5.get("FNMUSIC_KUGOU_TOKEN")))
+    check("回放旧表单值：用户关掉的开关没被打开",
+          e5.get("FNMUSIC_SAVE_WRITE_TAGS") == "0", repr(e5.get("FNMUSIC_SAVE_WRITE_TAGS")))
+    check("回放旧表单值：stderr 有 KEEP 提示（用户在安装界面看得见）",
+          "KEEP FNMUSIC_KUGOU_QUALITY" in r5.stderr, r5.stderr[-400:])
+    check("回放旧表单值：stdout 为空（提示绝不能写 stdout —— env_scalar 的返回值就是 stdout）",
+          r5.stdout.strip() == "", repr(r5.stdout[:300]))
+    check("本次新增的配置项仍能落地（.env 本无 LOCAL_FIRST → 写默认 1）",
+          e5.get("FNMUSIC_LOCAL_FIRST") == "1", repr(e5.get("FNMUSIC_LOCAL_FIRST")))
+
+    # ② 逃生口：显式要求采用向导值
+    L5b, r5b = seed_and_run({"FNMUSIC_KUGOU_QUALITY": "128",
+                             "FNMUSIC_ADOPT_WIZARD": "1"}, seeded)
+    e5b = read_env(L5b)
+    check("逃生口 FNMUSIC_ADOPT_WIZARD=1：音质采用向导值 128",
+          e5b.get("FNMUSIC_KUGOU_QUALITY") == "128", repr(e5b.get("FNMUSIC_KUGOU_QUALITY")))
+    check("逃生口：stderr 有 ADOPT 提示",
+          "ADOPT FNMUSIC_KUGOU_QUALITY" in r5b.stderr, r5b.stderr[-400:])
+    check("逃生口：未传向导值的键仍保留原值（token 不丢）",
+          e5b.get("FNMUSIC_KUGOU_TOKEN") == "TOKEN-保留我", repr(e5b.get("FNMUSIC_KUGOU_TOKEN")))
+
+    # ③ 逃生口 + 向导没传该字段 ⇒ 绝不能写成空值（比覆盖更糟）
+    L5c, r5c = seed_and_run({"FNMUSIC_ADOPT_WIZARD": "1"}, seeded)
+    e5c = read_env(L5c)
+    check("逃生口但向导未传该字段：值保持 high（不写成空）",
+          e5c.get("FNMUSIC_KUGOU_QUALITY") == "high", repr(e5c.get("FNMUSIC_KUGOU_QUALITY")))
+    check("逃生口但向导未传该字段：URL 也保持",
+          e5c.get("FNMUSIC_KUGOU_URL") == "http://127.0.0.1:4000",
+          repr(e5c.get("FNMUSIC_KUGOU_URL")))
+
+    # ④ 首次安装（.env 不存在）⇒ 向导值必须生效，这条**不能**被改坏
+    L5d, r5d = seed_and_run({"FNMUSIC_KUGOU_QUALITY": "high"}, None)
+    e5d = read_env(L5d)
+    check("首次安装（无 .env）：向导音质生效", e5d.get("FNMUSIC_KUGOU_QUALITY") == "high",
+          repr(e5d.get("FNMUSIC_KUGOU_QUALITY")))
+    L5e, r5e = seed_and_run({"FNMUSIC_KUGOU_QUALITY": "320"}, None)
+    check("首次安装（无 .env）：非默认向导值也生效",
+          read_env(L5e).get("FNMUSIC_KUGOU_QUALITY") == "320",
+          repr(read_env(L5e).get("FNMUSIC_KUGOU_QUALITY")))
+
+    for obj in (L, L2, L4, L5, L5b, L5c, L5d, L5e):
         obj.cleanup()
 
 
