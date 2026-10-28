@@ -162,12 +162,22 @@ fi
 
 # 生成 .env
 #
-# 两个容易踩的坑：
+# 三个容易踩的坑（前两条是修出来的，第三条是修第二条时修出来的）：
 # 1) 向导（wizard/install|config）里用户填的 FNMUSIC_* 是以**同名环境变量**
-#    传进来的。原实现把 URL/音质写死成默认值，用户填的地址安装完就被覆盖回
-#    127.0.0.1:8899，等于向导白填。这里改成"环境变量优先，缺省才用默认"。
+#    传进来的 —— 这是向导值唯一的传递通道。0.x 的原实现把 URL/音质写死成
+#    默认值，用户填的地址安装完就被覆盖回 127.0.0.1:8899，等于向导白填。
 # 2) 重装/覆盖安装时不能把用户已经存好的 token、落盘目录清空。已经存在的
-#    .env 先读进来当底值，再被环境变量覆盖。
+#    .env 先读进来当底值。
+# 3) ★ 但"环境变量无条件优先"会带来反向事故（P-05，1.0.2 修）：
+#    覆盖安装时向导会带着 initValue（http://127.0.0.1:8899 / high）一起提交，
+#    用户多半直接点"下一步"，于是这两个默认值把用户配好的
+#    http://127.0.0.1:4000 / high 冲掉。服务照跑、healthz 照报 ok，
+#    表现是"搜不到歌"而不是"装坏了"，极难定位。
+#    ⇒ 现在的规则（见 env_scalar）：用 initValue 当"用户没动过"的指纹。
+#         .env 不存在               → 向导值 > 默认值
+#         .env 存在 & 向导值==initValue → 保留 .env 旧值
+#         .env 存在 & 向导值!=initValue → 采用向导值（用户主动改过）
+#    想改配置请优先用扩展设置页（POST /_ext/settings，即时生效、不用重装）。
 ENV_FILE="$ETC_DIR/.env"
 # 1.0.0 分叉起：**不再有任何"从安装目录迁移 .env"的逻辑**。
 # 依据：本分支以 fnmusic_ext_kugou 2.1.0 为基线，2.1.0 的 .env 本来
@@ -196,38 +206,118 @@ env_current() {
     return 0
 }
 
-# 取底值：环境变量 > 已有 .env > 默认值
-env_base() {
-    local _key="$1" _default="$2" _val
-    _val="$(env_current "$_key")"
-    [ -n "${_val}" ] || _val="$_default"
-    # 向导填的字段以同名环境变量传入；用 bash 间接展开取，不 eval
-    if [ -n "${!_key:-}" ]; then
-        _val="${!_key}"
-    fi
-    env_clean "${_val}"
+# 读已有 .env 里某个 key 的原始值，**区分"键不存在"与"键存在但值为空"**。
+# 返回 0 = 键存在（输出可能是空串）；返回 1 = 键不存在 / 没有 .env。
+# 与上面的 env_current 的区别：env_current 是"有值才用"（凭证类语义），
+# 这里是"键在不在"（配置类语义）。两者不能混用 —— 布尔开关的 0 和空不是一回事。
+env_raw() {
+    local _key="$1" _line
+    [ -f "$ENV_FILE" ] || return 1
+    _line="$(grep -m1 "^${_key}=" "$ENV_FILE" 2>/dev/null)"
+    [ -n "$_line" ] || return 1
+    printf '%s' "${_line#*=}"
+    return 0
 }
 
-KUGOU_ENABLED="$(env_base FNMUSIC_KUGOU_ENABLED 1)"
-KUGOU_URL="$(env_base FNMUSIC_KUGOU_URL "http://127.0.0.1:8899")"
-KUGOU_QUALITY="$(env_base FNMUSIC_KUGOU_QUALITY "high")"
-KUGOU_TIMEOUT="$(env_base FNMUSIC_KUGOU_SEARCH_TIMEOUT 15)"
-LIBRARY_DIR="$(env_base FNMUSIC_LIBRARY_DIR "")"
-SAVE_ENABLED="$(env_base FNMUSIC_SAVE_ENABLED 0)"
-SAVE_DIR="$(env_base FNMUSIC_SAVE_DIR "")"
-SAVE_TAGS="$(env_base FNMUSIC_SAVE_WRITE_TAGS 1)"
-SAVE_COVER="$(env_base FNMUSIC_SAVE_WRITE_COVER 1)"
-SAVE_LYRIC="$(env_base FNMUSIC_SAVE_WRITE_LYRIC 1)"
+# 向导字段的 initValue —— 必须与 wizard/install、wizard/config、
+# wizard/ui/index.html 里的同名 field 一致。
+# tests/test_install_env_priority.py 会断言四处一致：默认值漂移是真实发生过的事故
+# （向导写 128、后端默认写 high，两处各自硬编码，谁也不知道对方变了）。
+wiz_default() {
+    case "$1" in
+        FNMUSIC_KUGOU_URL)            printf '%s' "http://127.0.0.1:8899" ;;
+        FNMUSIC_KUGOU_QUALITY)        printf '%s' "high" ;;
+        FNMUSIC_KUGOU_SEARCH_TIMEOUT) printf '%s' "15" ;;
+        FNMUSIC_KUGOU_ENABLED)        printf '%s' "1" ;;
+        *)                            printf '%s' "" ;;
+    esac
+}
+
+# 取值内核。$3 = scalar | flag
+#
+#   scalar（地址 / 目录 / 超时 / 枚举）：空值对它们没有意义，视为"未设置"。
+#   flag  （开关）：0 / false 是**有效表态**，不能被默认值盖掉。
+#
+# 两者只在"键存在但值为空"时有区别：flag 会多打一条 WARN，提醒这个空值是
+# 异常状态（历史上出现过"写入空行 → 读取侧回落默认 → 用户关掉的开关自己开回来"）。
+_env_take() {
+    local _key="$1" _default="$2" _kind="$3"
+    local _cur="" _has=0 _wiz _def _val
+
+    _wiz="${!_key:-}"                  # 向导传进来的值；空 = 向导没传这个字段
+    _def="$(wiz_default "$_key")"      # 向导的 initValue
+
+    if _cur="$(env_raw "$_key")"; then
+        _has=1
+    fi
+
+    if [ "$_has" = "1" ]; then
+        # —— .env 里已经有这个键：默认不覆盖 ——
+        if [ -z "$_wiz" ]; then
+            if [ -z "$_cur" ] && [ "$_kind" = "flag" ]; then
+                echo "[install_callback] WARN ${_key} 在 .env 中存在但值为空，按原样保留（不回落到默认 ${_default}）" >> "$LOGF"
+            fi
+            printf '%s' "$(env_clean "$_cur")"
+            return 0
+        fi
+        if [ "$_wiz" = "$_def" ]; then
+            # 向导值恰好等于 initValue ⇒ 用户没在向导里改过它，保留现有配置
+            echo "[install_callback] KEEP ${_key}: 向导值是默认值(${_def})，保留已有配置(${_cur})" >> "$LOGF"
+            printf '%s' "$(env_clean "$_cur")"
+            return 0
+        fi
+        # 向导值不同于 initValue ⇒ 用户主动改了，采用
+        echo "[install_callback] USE ${_key}: 向导值(${_wiz}) 不同于默认值(${_def})，按用户输入覆盖原值(${_cur})" >> "$LOGF"
+        printf '%s' "$(env_clean "$_wiz")"
+        return 0
+    fi
+
+    # —— .env 里没有这个键（首次安装，或本次新增的配置项）——
+    _val="$_wiz"
+    [ -n "$_val" ] || _val="$_default"
+    printf '%s' "$(env_clean "$_val")"
+}
+
+env_scalar() { _env_take "$1" "$2" scalar; }
+env_flag()   { _env_take "$1" "$2" flag; }
+
+# 写盘前备份 .env：配置事故要能一键回滚。只保留最近 3 份。
+backup_env() {
+    [ -f "$ENV_FILE" ] || return 0
+    local _bak _old
+    _bak="${ENV_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    if cp -p "$ENV_FILE" "$_bak" 2>/dev/null; then
+        chmod 600 "$_bak" 2>/dev/null || true
+        echo "[install_callback] .env 已备份 -> $_bak" >> "$LOGF"
+    else
+        echo "[install_callback] WARN: .env 备份失败（继续安装）" >> "$LOGF"
+        return 0
+    fi
+    ls -1t "${ENV_FILE}".bak.* 2>/dev/null | tail -n +4 | while IFS= read -r _old; do
+        rm -f "$_old" 2>/dev/null || true
+    done
+}
+
+KUGOU_ENABLED="$(env_flag   FNMUSIC_KUGOU_ENABLED 1)"
+KUGOU_URL="$(env_scalar FNMUSIC_KUGOU_URL "http://127.0.0.1:8899")"
+KUGOU_QUALITY="$(env_scalar FNMUSIC_KUGOU_QUALITY "high")"
+KUGOU_TIMEOUT="$(env_scalar FNMUSIC_KUGOU_SEARCH_TIMEOUT 15)"
+LIBRARY_DIR="$(env_scalar FNMUSIC_LIBRARY_DIR "")"
+SAVE_ENABLED="$(env_flag   FNMUSIC_SAVE_ENABLED 0)"
+SAVE_DIR="$(env_scalar FNMUSIC_SAVE_DIR "")"
+SAVE_TAGS="$(env_flag   FNMUSIC_SAVE_WRITE_TAGS 1)"
+SAVE_COVER="$(env_flag   FNMUSIC_SAVE_WRITE_COVER 1)"
+SAVE_LYRIC="$(env_flag   FNMUSIC_SAVE_WRITE_LYRIC 1)"
 # 去重索引目录：默认留空，由 app.py 推导到落盘目录下的隐藏子目录
 # （跟着曲库走，覆盖安装/升级不会丢，也就不会把听过的歌再存一遍）。
-SAVE_MARKER="$(env_base FNMUSIC_SAVE_MARKER_DIR "")"
+SAVE_MARKER="$(env_scalar FNMUSIC_SAVE_MARKER_DIR "")"
 # 这几个曾在 .env 里出现但没人回读，一并补齐（值都非凭证，可安全保留旧值）。
-# 注意 FNMUSIC_KUGOU_SEARCH_TIMEOUT 已在上面 KUGOU_TIMEOUT 处理（env_base 本身
-# 就优先环境变量、再旧值），这里不要再 echo 一遍 —— 重复键会让 .env 出现两行
-# 同名条目，读回时以后者为准，排障时极易看错。
-SAVE_MAX_BYTES="$(env_base FNMUSIC_SAVE_MAX_BYTES "")"
-SAVE_TIMEOUT="$(env_base FNMUSIC_SAVE_TIMEOUT_S "")"
-FAV_DIR="$(env_base FNMUSIC_FAV_DIR "")"
+# 注意 FNMUSIC_KUGOU_SEARCH_TIMEOUT 已在上面 KUGOU_TIMEOUT 处理，这里不要再
+# echo 一遍 —— 重复键会让 .env 出现两行同名条目，读回时以后者为准，
+# 排障时极易看错。
+SAVE_MAX_BYTES="$(env_scalar FNMUSIC_SAVE_MAX_BYTES "")"
+SAVE_TIMEOUT="$(env_scalar FNMUSIC_SAVE_TIMEOUT_S "")"
+FAV_DIR="$(env_scalar FNMUSIC_FAV_DIR "")"
 # 凭证类字段：只保留已有值（免得不小心把扫码登录存的 token 冲掉）。
 # 同样必须在写文件之前先读出来。
 TOKEN="$(env_clean "$(env_current FNMUSIC_KUGOU_TOKEN)")"
@@ -239,6 +329,10 @@ GUID="$(env_clean "$(env_current FNMUSIC_KUGOU_GUID)")"
 DEV="$(env_clean "$(env_current FNMUSIC_KUGOU_DEV)")"
 MACV="$(env_clean "$(env_current FNMUSIC_KUGOU_MAC)")"
 echo "[install_callback] .env 解析: url=${KUGOU_URL} quality=${KUGOU_QUALITY} library=${LIBRARY_DIR}" >> "$LOGF"
+
+# 写盘前先备份（.env.bak.<时间戳>，只留最近 3 份）。
+# 必须在所有 env_* 读完、且在任何写操作之前调用。
+backup_env
 
 # 写到临时文件再原子替换：避免"重定向先截断"把上面读到的值吃掉。
 ENV_TMP="${ENV_FILE}.tmp.$$"

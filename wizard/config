@@ -18,15 +18,15 @@
         "type": "select",
         "field": "FNMUSIC_KUGOU_QUALITY",
         "label": "优先音质",
-        "initValue": "128",
+        "initValue": "high",
         "options": [
           {
-            "label": "128kbps（推荐）",
-            "value": "128"
+            "label": "high（最高音质，推荐）",
+            "value": "high"
           },
           {
-            "label": "high（最高）",
-            "value": "high"
+            "label": "128kbps（省流量）",
+            "value": "128"
           },
           {
             "label": "320kbps（需 VIP）",
