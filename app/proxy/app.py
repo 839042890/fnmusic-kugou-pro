@@ -263,6 +263,10 @@ CONF = {
     "save_write_lyric": _env_flag("FNMUSIC_SAVE_WRITE_LYRIC", True),
     # 酷狗返回 flac 却查不到音质档位时，靠文件头嗅探兜底
     "save_sniff_ext": _env_flag("FNMUSIC_SAVE_SNIFF_EXT", True),
+    # 本地优先播放（1.0.2 / F-02）：已归档过的歌直接读本地文件，不再向酷狗
+    # 换 CDN。默认开 —— 本地能播就没必要再联网，断网时也能听。
+    # FNMUSIC_LOCAL_FIRST=0 可整体关闭（重启生效），用于排查"是不是本地文件有问题"。
+    "local_first": _env_flag("FNMUSIC_LOCAL_FIRST", True),
     # 落盘体积上限；超过只记日志不写盘，避免一个异常的"流"把曲库塞爆
     "save_max_bytes": _env_int("FNMUSIC_SAVE_MAX_BYTES", 512 * 1024 * 1024),
     "save_timeout_s": _env_float("FNMUSIC_SAVE_TIMEOUT_S", 300.0),
@@ -835,6 +839,7 @@ if _env_file.exists():
             "FNMUSIC_SAVE_WRITE_COVER": ("save_write_cover", "bool"),
             "FNMUSIC_SAVE_WRITE_LYRIC": ("save_write_lyric", "bool"),
             "FNMUSIC_SAVE_MARKER_DIR": ("save_marker_dir", "str"),
+            "FNMUSIC_LOCAL_FIRST": ("local_first", "bool"),
             # 以下三项 .env 里写了却没人读 → 网页端改完重启就"恢复"默认值。
             "FNMUSIC_SAVE_MAX_BYTES": ("save_max_bytes", "int"),
             "FNMUSIC_SAVE_TIMEOUT_S": ("save_timeout_s", "float"),
@@ -3065,17 +3070,56 @@ def resolve_marker_dir() -> str:
     return fallback
 
 
-def already_saved(guid: str) -> bool:
-    """是否已归档过（标记文件 + 目标文件真的还在，防止被用户删了却不再补存）。"""
+def saved_file_path(guid: str) -> str:
+    """已归档音频的本地路径；没有 / 已失效则返回空串。
+
+    「存过」的判据只有这一处：标记文件里记着路径，且目标文件仍在且非空。
+    already_saved() 是它的布尔版 —— 两者共用同一套校验，避免出现「说存过
+    但读不到」。顺带修正一处旧行为：以前用 os.path.exists()，若标记里存的
+    是个目录也会返回 True、getsize(目录) 通常 > 0，于是被当成"已存"。
+    改成 os.path.isfile() 才是真的"有文件可播"。
+    """
     if not guid:
-        return False
-    marker = _save_marker_path(guid)
+        return ""
     try:
-        with open(marker, encoding="utf-8") as f:
+        with open(_save_marker_path(guid), encoding="utf-8") as f:
             path = f.read().strip()
     except Exception:
-        return False
-    return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+        return ""
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        return path if os.path.getsize(path) > 0 else ""
+    except OSError:
+        return ""
+
+
+def already_saved(guid: str) -> bool:
+    """是否已归档过（标记文件 + 目标文件真的还在，防止被用户删了却不再补存）。"""
+    return bool(saved_file_path(guid))
+
+
+def saved_file_playable(guid: str) -> str:
+    """可以作为本地播放源时返回路径，否则返回空串（调用方应回落 CDN）。
+
+    比 saved_file_path() 多一步「试读首块」。理由是：文件大小正常但内容读不
+    出来（坏道、被截断、所在挂载点掉线、权限被改）这种情况，只看 size 是看不出
+    来的；而一旦进了 serve_file_with_range 就已经 return 了 Response，没法再
+    中途改成回落 CDN，客户端只会看到播放中断。
+
+    宁可多一次 64 KiB 的本地读，也不要"本来能播的歌播不了"。
+    """
+    path = saved_file_path(guid)
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            if not f.read(64 * 1024):
+                return ""
+    except Exception as e:
+        logger.warning("[LOCAL-FIRST] 试读失败，回落 CDN path=%s err=%s", path, e)
+        return ""
+    return path
 
 
 def mark_saved(guid: str, path: str) -> None:
@@ -3539,35 +3583,78 @@ def ext_from_content_type(content_type: str) -> str:
     return play_format_from_ext(ct.split("/")[-1] if "/" in ct else "mp3")
 
 
-def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+_RANGE_UNIT_RE = re.compile(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*\Z", re.I)
+
+RANGE_IGNORE = "ignore"
+RANGE_UNSAT = "unsatisfiable"
+RANGE_OK = "ok"
+
+
+def parse_single_byte_range(range_header: str | None, file_size: int) -> tuple[str, int, int]:
+    """严格解析单段 byte-range（RFC 7233 §2.1 / §3.1 / §4.4）。三态返回。
+
+    这是个**语义**问题，不只是代码风格：原来的 parse_http_range() 用 None 同时
+    表示"没有 Range 头"和"范围不可满足"，调用方没法区分，只能一律当成"没带
+    Range"处理 —— 于是越界请求会拿到 200 + 整个文件，播放器一拖进度条就往回
+    拉全量。RFC 7233 §4.4 要求这种情况回 416。
+
+    - RANGE_IGNORE : 没有 Range / 语法无效 / 多段 / 未知单位 → §3.1 要求**忽略**
+                     Range，回 200 全量（不是 416：能解析单段才谈得上满足与否）
+    - RANGE_UNSAT  : 语法合法但整段落在文件之外（start >= size，或 bytes=-0）
+                     → 416 + Content-Range: bytes */<size>
+    - RANGE_OK     : 可满足的闭区间 [start, end]
+    """
     if not range_header:
-        return None
-    m = re.match(r"bytes=(\d*)-(\d*)", range_header.strip(), re.I)
+        return RANGE_IGNORE, 0, 0
+    m = _RANGE_UNIT_RE.match(range_header.strip())
     if not m:
-        return None
+        # 多段（bytes=0-1,5-6）我们只服务单段；未知单位（items=0-）同理。
+        # 按 RFC 宁可忽略也不要假装满足其中一段。
+        return RANGE_IGNORE, 0, 0
     start_s, end_s = m.group(1), m.group(2)
     if start_s == "" and end_s == "":
-        return None
+        return RANGE_IGNORE, 0, 0
     if start_s == "":
         suffix = int(end_s)
-        start = max(file_size - suffix, 0)
-        end = file_size - 1
-    else:
-        start = int(start_s)
-        end = int(end_s) if end_s else file_size - 1
+        if suffix <= 0:                     # bytes=-0 永远不可满足
+            return RANGE_UNSAT, 0, 0
+        return RANGE_OK, max(file_size - suffix, 0), file_size - 1
+    start = int(start_s)
+    if start >= file_size:                  # 起点已在文件之外
+        return RANGE_UNSAT, 0, 0
+    end = int(end_s) if end_s else file_size - 1
     end = min(end, file_size - 1)
-    if start < 0 or start >= file_size or start > end:
-        return None
-    return start, end
+    if start > end:
+        return RANGE_UNSAT, 0, 0
+    return RANGE_OK, start, end
 
+
+def etag_matches(if_none_match: str, etag: str) -> bool:
+    """If-None-Match 的匹配规则（RFC 7232 §3.2）。弱比较：W/"x" 与 "x" 视为相同。"""
+    if not if_none_match:
+        return False
+    cand = if_none_match.strip()
+    if cand == "*":
+        return True
+
+    def _norm(v: str) -> str:
+        v = v.strip()
+        return v[2:].strip() if v.startswith("W/") else v
+
+    target = _norm(etag)
+    return any(_norm(part) == target for part in cand.split(","))
 
 
 
 def _bytes_cache_headers(body: bytes) -> dict:
-    """为内存缓存的音频生成缓存协商头：ETag + Last-Modified + Cache-Control。
+    """为内存缓存的音频生成 ETag + Last-Modified + Cache-Control。
 
-    ETag 用内容哈希生成（内容稳定），Last-Modified 用当前时间（首次缓存时刻近似），
-    使浏览器可做 If-None-Match / If-Modified-Since 协商，避免重复下载。
+    ETag 用内容哈希生成（内容稳定），Last-Modified 用当前时间（首次缓存时刻近似）。
+
+    ⚠ 这里**只把 ETag 提供给客户端**用于缓存，服务端并不据此判 304：
+    内存版的 ETag 每来一个请求都要对整首算一遍 md5，"判 304"比"直接把数据发出去"
+    还贵。真正的 304 在本地文件版 serve_file_with_range() 里 —— 那里用
+    size-mtime 弱 ETag，几乎零成本，所以判得起。
     """
     etag = hashlib.md5(body).hexdigest()
     now_ts = time.time()
@@ -3581,22 +3668,43 @@ def _bytes_cache_headers(body: bytes) -> dict:
 
 
 def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: str) -> Response:
-    """纯内存响应：不落盘，仅在当前进程内缓存的音频上支持 Range。"""
+    """纯内存响应：不落盘，仅在当前进程内缓存的音频上支持 Range。
+
+    越界 Range 与本地文件版共用 parse_single_byte_range()，两处给出同一个答案。
+    这不是洁癖：同一首歌在"刚播过、还在内存缓存"和"已落盘"两种状态下，对同一个
+    越界 Range 若一个回 200、一个回 416，问题就变成"时好时坏"，几乎无法复现。
+
+    这里**不做** 304：内存版的 ETag 是内容 md5（_bytes_cache_headers 里现算），
+    每来一个请求都要对整首算一遍，比省下的那点流量贵得多。留待 1.0.3。
+    """
     file_size = len(body)
-    rng = parse_http_range(range_header, file_size)
+    kind, start, end = parse_single_byte_range(range_header, file_size)
     cache_hdrs = _bytes_cache_headers(body)
 
     def iter_bytes(offset: int, length: int) -> AsyncGenerator[bytes, None]:
         async def gen() -> AsyncGenerator[bytes, None]:
             pos = offset
-            end = offset + length
-            while pos < end:
-                yield body[pos:min(pos + 64 * 1024, end)]
+            stop = offset + length
+            while pos < stop:
+                yield body[pos:min(pos + 64 * 1024, stop)]
                 pos += 64 * 1024
 
         return gen()
 
-    if rng is None:
+    if kind == RANGE_UNSAT:
+        logger.info(
+            "[RANGE] 内存版不可满足 → 416 size=%d range=%r", file_size, range_header
+        )
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": f"bytes */{file_size}",
+                "Accept-Ranges": "bytes",
+                **cache_hdrs,
+            },
+        )
+
+    if kind == RANGE_IGNORE:
         return StreamingResponse(
             iter_bytes(0, file_size),
             status_code=200,
@@ -3608,7 +3716,6 @@ def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: st
             },
         )
 
-    start, end = rng
     length = end - start + 1
     return StreamingResponse(
         iter_bytes(start, length),
@@ -3623,6 +3730,107 @@ def serve_bytes_with_range(body: bytes, range_header: str | None, media_type: st
     )
 
 
+async def serve_file_with_range(
+    path: str,
+    range_header: str | None,
+    media_type: str,
+    request: Request | None = None,
+) -> Response:
+    """从本地文件服务音频：200 / 206 / 304 / 416。
+
+    与 serve_bytes_with_range 的区别：内容来自磁盘，**流式读**，绝不把整首
+    flac（高音质常见几十上百 MB）读进内存 —— 内存里那份缓存有 48 MiB 上限，
+    而这里必须能服务任意大小的本地文件。
+    """
+    try:
+        st = os.stat(path)
+        file_size = st.st_size
+    except OSError as e:
+        logger.warning("[LOCAL-FIRST] stat 失败 path=%s err=%s", path, e)
+        return JSONResponse(
+            content={"code": 404, "msg": "local file unavailable", "data": None},
+            status_code=404,
+        )
+    if file_size <= 0:
+        return JSONResponse(
+            content={"code": 404, "msg": "local file empty", "data": None},
+            status_code=404,
+        )
+
+    # 本地文件存完就固定，size-mtime 做弱 ETag 足够，比内存版算 md5 便宜得多。
+    etag = f'"{file_size:x}-{int(st.st_mtime):x}"'
+    last_mod = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(st.st_mtime))
+    base_hdrs = {
+        "ETag": etag,
+        "Last-Modified": last_mod,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=86400",
+        "Access-Control-Expose-Headers": (
+            "Accept-Ranges, Content-Range, Content-Length, ETag, Last-Modified"
+        ),
+    }
+
+    # 条件请求：命中就直接 304，连文件都不打开（RFC 7232 §4.1）。
+    # 304 不带正文，也不带 Content-Length —— 带上会让部分播放器误判成"0 字节"。
+    if request is not None and etag_matches(request.headers.get("if-none-match") or "", etag):
+        logger.info("[LOCAL-FIRST] 304 not-modified path=%s size=%d", path, file_size)
+        return Response(status_code=304, headers=base_hdrs)
+
+    kind, start, end = parse_single_byte_range(range_header, file_size)
+    if kind == RANGE_UNSAT:
+        # 只回 416 + Content-Range: bytes */size。绝不回落成 200 ——
+        # 那会让"拖一下进度条"变成"重新下载整个文件"。
+        logger.info(
+            "[LOCAL-FIRST] range 不可满足 → 416 path=%s size=%d range=%r",
+            path, file_size, range_header,
+        )
+        return Response(
+            status_code=416,
+            headers={**base_hdrs, "Content-Range": f"bytes */{file_size}"},
+        )
+
+    def iter_file(offset: int, length: int) -> AsyncGenerator[bytes, None]:
+        async def gen() -> AsyncGenerator[bytes, None]:
+            pos = offset
+            stop = offset + length
+            try:
+                with open(path, "rb") as f:
+                    f.seek(pos)
+                    while pos < stop:
+                        chunk = f.read(min(256 * 1024, stop - pos))
+                        if not chunk:
+                            break
+                        pos += len(chunk)
+                        yield chunk
+            except Exception as e:
+                # 生成器已经交给 StreamingResponse，此时无法改成回落 CDN；
+                # 只能记日志 + 结束流（客户端表现为播放中断，可重试）。
+                logger.warning("[LOCAL-FIRST] 读文件失败 path=%s pos=%s err=%s", path, pos, e)
+
+        return gen()
+
+    if kind == RANGE_IGNORE:
+        return StreamingResponse(
+            iter_file(0, file_size),
+            status_code=200,
+            headers={
+                **base_hdrs,
+                "Content-Type": media_type,
+                "Content-Length": str(file_size),
+            },
+        )
+
+    length = end - start + 1
+    return StreamingResponse(
+        iter_file(start, length),
+        status_code=206,
+        headers={
+            **base_hdrs,
+            "Content-Type": media_type,
+            "Content-Length": str(length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+        },
+    )
 def get_upstream_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "upstream_client", None)
     if client is None:
@@ -6140,6 +6348,26 @@ async def stream_track(request: Request):
 
     src = source_from_online_guid(guid)
     if src == "kugou":
+        # 本地优先（1.0.2 / F-02）：这首歌已经边播边存过就直接读本地文件，
+        # 不再向酷狗换 CDN 链接。除了快，更重要的是断网 / CDN 失效时也能播。
+        # 顺序在内存缓存之后（上面几行）：内存比磁盘快，先命中更划算。
+        local_path = saved_file_playable(guid) if CONF.get("local_first", True) else ""
+        if local_path:
+            ext = (os.path.splitext(local_path)[1].lstrip(".") or "mp3").lower()
+            try:
+                local_size = os.path.getsize(local_path)
+            except OSError:
+                local_size = -1
+            # size + ext 一起打：mp3/128k 存档与 flac/high 存档一眼能分开。
+            # 本地命中时音质在**落盘那一刻**就固定了，与本次请求的档位无关 ——
+            # 用户看到文件偏小、又觉得"音质怎么没变好"，就能自己对上号。
+            logger.info(
+                "[LOCAL-FIRST] hit guid=%s ext=%s size=%d path=%s quality_fixed_at_archive=1",
+                guid, ext, local_size, local_path,
+            )
+            return await serve_file_with_range(
+                local_path, range_header, media_type_for_ext(ext), request
+            )
         raw_song_id = song_id_from_online_guid(guid)
         info = await kugou_source.get_info(raw_song_id) or {}
         play_url, resolved_ext = await resolve_kugou_url(raw_song_id, quality_tier=info.get("_matched_tier"))
@@ -8293,6 +8521,8 @@ def _settings_payload() -> dict:
         "save_write_tags": CONF.get("save_write_tags", True),
         "save_write_cover": CONF.get("save_write_cover", True),
         "save_write_lyric": CONF.get("save_write_lyric", True),
+        # 本地优先播放：已归档的歌直接读本地文件（1.0.2 / F-02）
+        "local_first": CONF.get("local_first", True),
         # 去重标记目录：留空 = 跟落盘目录走（推荐）。暴露出来是为了让用户能在
         # 升级/迁移时把它一起带走，避免重播时重复落盘成「歌名 (2)」。
         "save_marker_dir": CONF.get("save_marker_dir", ""),
@@ -8503,6 +8733,9 @@ async def _save_settings_impl(form):
     if "save_write_lyric" in form:
         env_content["FNMUSIC_SAVE_WRITE_LYRIC"] = _bool_to_digit(form["save_write_lyric"])
         CONF["save_write_lyric"] = env_content["FNMUSIC_SAVE_WRITE_LYRIC"] == "1"
+    if "local_first" in form:
+        env_content["FNMUSIC_LOCAL_FIRST"] = _bool_to_digit(form["local_first"])
+        CONF["local_first"] = env_content["FNMUSIC_LOCAL_FIRST"] == "1"
     # 兼容 wizard 的字段名：它与网页端存的是同一个落盘目录
     if "library_dir" in form:
         cleaned = _sanitize_env_value(form["library_dir"])

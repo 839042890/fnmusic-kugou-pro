@@ -295,7 +295,17 @@ async def main():
         print("=" * 70)
         before = sorted(p.name for p in SAVE_DIR.glob("*.flac"))
         r2 = await client.get(f"/music/api/v1/track/stream?guid={guid}")
-        check("第二次播放仍正常返回", r2.status_code == 200 and r2.content == AUDIO_BYTES)
+        # F-02（1.0.2）起第二次播放会命中「本地优先」，读的是磁盘上那份归档
+        # 文件；归档时写过标签，字节与原 CDN 流不同（本用例里长度恰好相同，
+        # 但内容不等）。所以不能再拿 AUDIO_BYTES 比，改比磁盘上那份文件 ——
+        # 这同时也正面证明了确实走了本地优先，没有再去请求酷狗。
+        archived = sorted(SAVE_DIR.glob("*.flac"))
+        check("第二次播放仍正常返回", r2.status_code == 200 and len(r2.content) > 0)
+        check(
+            "第二次播放读的是本地归档文件（本地优先）",
+            bool(archived) and r2.content == archived[0].read_bytes(),
+            f"archived={len(archived)}",
+        )
         await asyncio.sleep(3)
         after = sorted(p.name for p in SAVE_DIR.glob("*.flac"))
         check("没有产生重复文件", before == after, f"{before} -> {after}")

@@ -37,16 +37,58 @@ echo "[install_callback] APPDEST=$APPDEST" >> "$LOGF"
 # 且那才是真正会造成"两版共存"的时刻。若确实被占用，启动会明确拒绝。
 TARGET_SOCK="/var/run/trim_music.socket"
 if [ -S "$TARGET_SOCK" ]; then
-    _h="$(curl -s --max-time 2 --unix-socket "$TARGET_SOCK" http://localhost/_ext/healthz 2>/dev/null || true)"
-    if echo "$_h" | grep -q '"upstream"'; then
-        _pid="$(ss -xlp 2>/dev/null | grep -F "$TARGET_SOCK" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
-        _cmd=""
-        [ -n "$_pid" ] && [ -r "/proc/$_pid/cmdline" ] && _cmd="$(tr '\0' ' ' < "/proc/$_pid/cmdline" 2>/dev/null)"
-        echo "[install_callback] WARN: 音乐接口已被其他音源扩展占用 -> pid=$_pid cmd=$_cmd" >> "$LOGF"
-        echo "[install_callback] WARN: 请先到【应用中心】停用并卸载旧扩展 fnmusic_ext_kugou，" >> "$LOGF"
-        echo "[install_callback] WARN: 否则本应用启动时会被拒绝（详见 说明.md）。" >> "$LOGF"
+    # 谁在持有这个 socket？—— 只看事实，不猜。
+    #
+    # 旧实现两处硬伤，都属于"看着能跑"的类型：
+    #   1) `ss ... | head -1` 只取一个 pid，等于抽盲盒。真机上 uvicorn 与
+    #      app_socket_bridge 会同时持有（fork 共享 fd），一个 socket 也可能挂
+    #      多条记录 —— 取一条既可能漏掉真正的占用者，也可能抓到无关进程。
+    #   2) 靠"能不能从 healthz 嗅到 upstream 字段"判断是不是扩展。于是
+    #      **重装自己必然误报**（我们的 healthz 正好有这个字段），而真被别的
+    #      扩展占用时反而可能漏报（对方没实现 healthz 就嗅不到）。
+    #
+    # 现在：把**所有**持有者的 pid 全取出来，逐个看 /proc/<pid>/exe 与 cwd，
+    # 按"可执行文件在哪个应用目录下"分类。用 exe 而不是整条 cmdline，是因为
+    # 接管同一个 socket 的扩展，命令行里**必然**带着 /var/run/trim_music.socket
+    # 这个路径 —— 拿 cmdline 判断会把它们全认成飞牛音乐本体。
+    # 这里踩过一个坑，记下来：不能加 `tail -n +2` 去"跳过表头" ——
+    # `ss -x` 输出**本来就没有表头**（`ss -t` 才有），tail 会把唯一那一行
+    # 直接删掉，于是 _pids 永远为空、占用检测静默失效（看着一切正常，
+    # 其实什么都没查）。用 grep -F 过滤 socket 路径就够了。
+    _pids="$(ss -xlp 2>/dev/null | grep -F "$TARGET_SOCK" \
+        | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)"
+    if [ -z "$_pids" ]; then
+        echo "[install_callback] INFO: socket 存在但读不到持有进程（权限不足或 ss 格式变动），跳过占用检测" >> "$LOGF"
     else
-        echo "[install_callback] 音乐接口当前由飞牛音乐本体持有（正常）" >> "$LOGF"
+        _self_pids=""
+        _music_pids=""
+        _other_desc=""
+        for _p in $_pids; do
+            _exe="$(readlink -f "/proc/$_p/exe" 2>/dev/null || true)"
+            _cwd="$(readlink -f "/proc/$_p/cwd" 2>/dev/null || true)"
+            _sig="$_exe $_cwd"
+            if [ -z "$_exe" ]; then
+                # 读不到 exe（非 root / 进程刚退）：退回 cmdline，但先把 socket
+                # 路径本身剔掉，否则"其他扩展"会被 socket 路径带偏成音乐本体。
+                _cmd="$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)"
+                _sig="$(printf '%s' "$_cmd" | sed "s|$TARGET_SOCK||g")"
+            fi
+            case "$_sig" in
+                *fnmusic_kugou_pro*) _self_pids="$_self_pids $_p" ;;
+                *trim.music*|*trim-music*) _music_pids="$_music_pids $_p" ;;
+                *) _other_desc="$_other_desc [pid=$_p $(printf '%s' "$_sig" | cut -c1-160)]" ;;
+            esac
+        done
+        # 补 || true：`[ -n ] && echo` 在条件为假时整体返回 1。本脚本没有
+        # set -e，所以现在无害；但哪天有人加了 set -e，这行会让安装在写 .env
+        # **之前**静默退出。安装脚本最不该有的就是"看起来跑完了"。
+        [ -n "$_self_pids" ] && echo "[install_callback] INFO: 目标 socket 由本应用自己持有（pid$_self_pids），按覆盖安装处理（正常）" >> "$LOGF" || true
+        [ -n "$_music_pids" ] && echo "[install_callback] INFO: 目标 socket 由飞牛音乐本体持有（pid$_music_pids），正常" >> "$LOGF" || true
+        if [ -n "$_other_desc" ]; then
+            echo "[install_callback] WARN: 音乐接口已被其他音源扩展占用 ->$_other_desc" >> "$LOGF"
+            echo "[install_callback] WARN: 请先到【应用中心】停用并卸载旧扩展 fnmusic_ext_kugou，" >> "$LOGF"
+            echo "[install_callback] WARN: 否则本应用启动时会被拒绝（详见 说明.md）。" >> "$LOGF"
+        fi
     fi
 fi
 
@@ -169,10 +211,10 @@ fi
 # 2) 重装/覆盖安装时不能把用户已经存好的 token、落盘目录清空。已经存在的
 #    .env 先读进来当底值。
 # 3) ★ 但"环境变量无条件优先"会带来反向事故（P-05，1.0.2 修）：
-#    覆盖安装时向导会带着 initValue（http://127.0.0.1:8899 / high）一起提交，
-#    用户多半直接点"下一步"，于是这两个默认值把用户配好的
-#    http://127.0.0.1:4000 / high 冲掉。服务照跑、healthz 照报 ok，
-#    表现是"搜不到歌"而不是"装坏了"，极难定位。
+#    覆盖安装时向导会带着 initValue（见 wiz_default 里的地址/音质）一起提交，
+#    用户多半直接点"下一步"，于是这两个默认值把用户自己配好的地址与音质冲掉。
+#    服务照跑、healthz 照报 ok，表现是"搜不到歌"而不是"装坏了"，极难定位。
+#    （这里**不写具体端口**：cmd/ 会打进分发包，那是本机部署事实，不是产品事实。）
 #    ⇒ 现在的规则（见 env_scalar）：用 initValue 当"用户没动过"的指纹。
 #         .env 不存在               → 向导值 > 默认值
 #         .env 存在 & 向导值==initValue → 保留 .env 旧值
@@ -308,6 +350,10 @@ SAVE_DIR="$(env_scalar FNMUSIC_SAVE_DIR "")"
 SAVE_TAGS="$(env_flag   FNMUSIC_SAVE_WRITE_TAGS 1)"
 SAVE_COVER="$(env_flag   FNMUSIC_SAVE_WRITE_COVER 1)"
 SAVE_LYRIC="$(env_flag   FNMUSIC_SAVE_WRITE_LYRIC 1)"
+# 本地优先播放（1.0.2 / F-02）：已归档过的歌直接读本地文件，不再向酷狗换 CDN。
+# 默认开。写成 .env 里的一行是为了让用户能一眼看到、也能手工关掉排查问题；
+# 关掉的等价写法是 FNMUSIC_LOCAL_FIRST=0（重启生效）。
+LOCAL_FIRST="$(env_flag FNMUSIC_LOCAL_FIRST 1)"
 # 去重索引目录：默认留空，由 app.py 推导到落盘目录下的隐藏子目录
 # （跟着曲库走，覆盖安装/升级不会丢，也就不会把听过的歌再存一遍）。
 SAVE_MARKER="$(env_scalar FNMUSIC_SAVE_MARKER_DIR "")"
@@ -355,6 +401,7 @@ ENV_TMP="${ENV_FILE}.tmp.$$"
     echo "FNMUSIC_SAVE_WRITE_TAGS=${SAVE_TAGS}"
     echo "FNMUSIC_SAVE_WRITE_COVER=${SAVE_COVER}"
     echo "FNMUSIC_SAVE_WRITE_LYRIC=${SAVE_LYRIC}"
+    echo "FNMUSIC_LOCAL_FIRST=${LOCAL_FIRST}"
     echo "FNMUSIC_SAVE_MARKER_DIR=${SAVE_MARKER}"
     echo "FNMUSIC_SAVE_MAX_BYTES=${SAVE_MAX_BYTES}"
     echo "FNMUSIC_SAVE_TIMEOUT_S=${SAVE_TIMEOUT}"

@@ -66,6 +66,8 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <select id="save_write_cover"><option value="1">内嵌封面，并另存同名图片</option><option value="0">不处理封面</option></select>
 <label>歌词</label>
 <select id="save_write_lyric"><option value="1">另存同名 .lrc</option><option value="0">不存歌词</option></select>
+<label>播放优先使用本地文件</label>
+<select id="local_first"><option value="1">开启（已存过的歌直接读本地，推荐）</option><option value="0">关闭（每次都走酷狗 CDN）</option></select>
 <label>去重索引目录（留空 = 跟随落盘目录，推荐）</label>
 <input type="text" id="save_marker_dir" placeholder="留空即可，会自动放到落盘目录下的 .fnmusic_save_index">
 <div class="hint" id="save-marker-hint">探测中...</div>
@@ -114,7 +116,7 @@ const b=document.getElementById('save-badge');
 if(d.save_enabled){b.className='badge on';b.textContent='已开启';}else{b.className='badge off';b.textContent='未开启';}
 document.getElementById('save_enabled').value=d.save_enabled?'1':'0';
 document.getElementById('save_dir').value=d.save_dir||'';
-document.getElementById('save_write_tags').value=d.save_write_tags?'1':'0';
+document.getElementById('save_write_tags').value=d.save_write_tags?'1':'0';document.getElementById('local_first').value=d.local_first?'1':'0';
 document.getElementById('save_write_cover').value=d.save_write_cover?'1':'0';
 document.getElementById('save_write_lyric').value=d.save_write_lyric?'1':'0';
 document.getElementById('save_marker_dir').value=d.save_marker_dir||'';
@@ -130,7 +132,7 @@ document.getElementById('kugou_search_timeout').value=(d.kugou_search_timeout===
 document.getElementById('save_max_bytes').value=(d.save_max_bytes===undefined?'':d.save_max_bytes);
 document.getElementById('save_timeout_s').value=(d.save_timeout_s===undefined?'':d.save_timeout_s);
 }catch(e){document.getElementById('save-dir-hint').textContent='读取设置失败：'+e.message;}}
-async function saveSaveOpts(){try{const qs=['save=1','save_enabled='+document.getElementById('save_enabled').value,'save_dir='+encodeURIComponent(document.getElementById('save_dir').value.trim()),'save_marker_dir='+encodeURIComponent(document.getElementById('save_marker_dir').value.trim()),'save_write_tags='+document.getElementById('save_write_tags').value,'save_write_cover='+document.getElementById('save_write_cover').value,'save_write_lyric='+document.getElementById('save_write_lyric').value].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
+async function saveSaveOpts(){try{const qs=['save=1','save_enabled='+document.getElementById('save_enabled').value,'save_dir='+encodeURIComponent(document.getElementById('save_dir').value.trim()),'save_marker_dir='+encodeURIComponent(document.getElementById('save_marker_dir').value.trim()),'save_write_tags='+document.getElementById('save_write_tags').value,'save_write_cover='+document.getElementById('save_write_cover').value,'save_write_lyric='+document.getElementById('save_write_lyric').value,'local_first='+document.getElementById('local_first').value].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
 async function saveAdvancedOpts(){try{const v=(id)=>document.getElementById(id).value.trim();const qs=['save=1','fav_dir='+encodeURIComponent(v('fav_dir')),'kugou_search_timeout='+encodeURIComponent(v('kugou_search_timeout')),'save_max_bytes='+encodeURIComponent(v('save_max_bytes')),'save_timeout_s='+encodeURIComponent(v('save_timeout_s'))].join('&');const d=await jget('/_ext/settings?'+qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
 async function loadLogin(){try{const d=await jget('/_ext/login/status');const b=document.getElementById('login-badge');if(d.status==='logged_in'){b.className='badge on';b.textContent='已登录';document.getElementById('login-userid').style.display='flex';document.getElementById('login-userid-val').textContent=d.userid||'';document.getElementById('btn-login').style.display='none';document.getElementById('btn-logout').style.display='inline-block';}else{b.className='badge off';b.textContent='未登录';document.getElementById('login-userid').style.display='none';document.getElementById('btn-login').style.display='inline-block';document.getElementById('btn-logout').style.display='none';}}catch(e){}}
 async function loadAll(){hideMsg();loadHealth();loadSettings();loadSaveOpts();loadLogin();}
