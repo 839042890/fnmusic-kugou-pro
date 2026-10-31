@@ -9,7 +9,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86-green.svg)]()
-![Version](https://img.shields.io/badge/version-1.0.4-orange.svg)
+![Version](https://img.shields.io/badge/version-1.0.5-orange.svg)
 
 ---
 
@@ -370,6 +370,14 @@ sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 
 > ⚠️ 过滤只作用于**酷狗来源的歌单**。飞牛本地曲库里的歌单、以及「收藏」不受影响。
 
+> ⚠️ **「每日推荐 / 排行榜 / 精选歌单」这三个入口不受歌单映射（F-03）约束** ——
+> 它们是虚拟歌单，不属于任何酷狗账号下的用户歌单，没有歌单 ID 可言，
+> 所以 `whitelist` / `blacklist` 都管不到它们：配了白名单之后它们**依然会显示**。
+> 想关掉它们请用开关 `FNMUSIC_FEED=0`（写在 `.env` 里，重启应用生效），
+> 不要试图把它们写进 `playlist_map.json` 的 `ids`。
+> 排查时看日志：`[PLAYLIST_MAP] filtered 2/7 ... feed=25 total=32`
+> 里的 `feed=` 就是被放行的虚拟歌单条数，`2/7` 的分母只算真正参与判定的歌单。
+
 ---
 
 ## 常见问题
@@ -395,6 +403,7 @@ sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 
 | 版本 | 要点 |
 |---|---|
+| **1.0.5** | 新增 **F-01 三个歌单入口**：每日推荐（30 首）、排行榜（当日全部榜单，现 6 个）、精选歌单（前 20 张）；开关 `FNMUSIC_FEED`（默认开）；修精选「全量」只到 100 首（上游总数在 `data.count`）；修开白名单时三个入口整体消失（虚拟歌单不该过歌单映射） |
 | **1.0.4** | 新增 **F-03 歌单映射**：同一个酷狗账号，多个飞牛用户各看各的歌单（whitelist / blacklist / all，用户名 → guid → default）；4 个入口统一拦截；被屏蔽返回同构空数据而非 404；`playlist_map.json` 热加载、无需重启；另修「只配 default 时功能静默失效」 |
 | **1.0.3** | P-05 残留修复：升级时不再被平台回放的旧表单值覆盖配置；新增 `FNMUSIC_ADOPT_WIZARD=1` 逃生口；`KEEP` 提示改为写进安装输出 |
 | **1.0.2** | P-05 安装/覆盖安装不再冲掉用户 `.env`；F-02 本地优先播放；HTTP Range 语义统一（越界 416）；音乐接口占用检测重写 |
@@ -403,7 +412,7 @@ sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 
 > 本项目的版本号**独立计数**，不继承上游序列。
 > **`1.0.0` 是本项目第一个公开发布版本**，此后依次发布
-> `1.0.1`（2026-10-19）、`1.0.2`（2026-10-28）、`1.0.3`（2026-10-28）、`1.0.4`（2026-10-28）。
+> `1.0.1`（2026-10-19）、`1.0.2`（2026-10-28）、`1.0.3`（2026-10-28）、`1.0.4`（2026-10-28）、`1.0.5`（2026-10-31）。
 > ⚠️ 编号有个历史坑：`1.0.0` 之前开发中的两次内部构建**也曾借用 `1.0.1` / `1.0.2`
 > 这两个号**，从未对外发布、内容已并入 `1.0.0`。所以在旧材料里看到「1.0.1」「1.0.2」，
 > 有可能指的是那两次内部构建 —— **判断新旧请以日期和上表为准**。

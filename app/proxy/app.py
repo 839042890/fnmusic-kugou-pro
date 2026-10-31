@@ -199,6 +199,9 @@ def _env_float(key: str, default: float) -> float:
 
 CONF = {
     "kugou_enabled": _env_flag("FNMUSIC_KUGOU_ENABLED", True),
+    # F-01：每日推荐 / 排行榜 / 精选歌单（虚拟歌单）。关掉后「我的歌单」回到
+    # 只有用户歌单 + 官方歌单的原行为，零额外上游请求。
+    "kugou_feed": _env_flag("FNMUSIC_FEED", True),
     "kugou_url": _env_str("FNMUSIC_KUGOU_URL", "http://127.0.0.1:8899"),
     "kugou_quality": _env_str("FNMUSIC_KUGOU_QUALITY", "high"),
     "kugou_search_timeout": _env_float("FNMUSIC_KUGOU_SEARCH_TIMEOUT", 15.0),
@@ -296,6 +299,192 @@ def kugou_playlist_id_from_guid(guid: str) -> str:
         return ""
     rest = s[len(_KUGOU_PLAYLIST_PREFIX):]
     return rest.split(":", 1)[0]
+
+
+# ===== F-01：虚拟歌单（每日推荐 / 排行榜 / 精选歌单）=====
+# guid 形如：
+#   online:kugou:feed:daily
+#   online:kugou:feed:rank:<rankid>
+#   online:kugou:feed:special:<global_collection_id>
+#
+# ⚠️ **不要**复用 playlist 前缀：kugou_playlist_id_from_guid 是"按 : 切第一段"，
+#    把 rank:84235 塞进 playlist 前缀会切成 "rank"，真实 ID 直接丢失。
+#    所以 feed 用自己的前缀 + 自己的解析函数，playlist 那套一行都不动。
+_KUGOU_FEED_PREFIX = "online:kugou:feed:"
+
+# 精选歌单每页 40 条，全量注入会把「我的歌单」刷成 40+ 条看起来像故障。
+# 取前 N 条即"精选"；要放开只改这一个常量（判断依据见 F-01 结论文档）。
+_FEED_SPECIAL_LIMIT = 20
+# 排行榜一次最多注入几个榜（/rank/top 目前固定 6 个）。
+_FEED_RANK_LIMIT = 8
+
+# guid -> {"name","cover","count"}。detail/batch 拿不到名字时用来兜底
+# （飞牛点进歌单只发 detail，不会重发 list，不缓存就会显示成 "排行榜 · 84235"）。
+_FEED_META: dict[str, dict] = {}
+
+# 榜单 rankid -> (过期时间, 曲目数)。/rank/top 不给曲目数，只能看 /rank/audio 的
+# total；不缓存就等于每次打开「我的歌单」都多打 N 次上游。
+_FEED_COUNT_CACHE: dict[str, tuple[float, int]] = {}
+_FEED_COUNT_TTL = 600.0
+
+
+def _feed_sanitize(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", str(text or "").strip())
+
+
+def kugou_feed_guid(kind: str, ident: str = "") -> str:
+    k = _feed_sanitize(kind)
+    i = _feed_sanitize(ident)
+    return f"{_KUGOU_FEED_PREFIX}{k}:{i}" if i else f"{_KUGOU_FEED_PREFIX}{k}"
+
+
+def is_kugou_feed_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(_KUGOU_FEED_PREFIX)
+
+
+def parse_kugou_feed_guid(guid: str | None) -> tuple[str, str]:
+    """feed guid -> (kind, ident)。kind ∈ daily/rank/special；不合法返回 ("","")。"""
+    s = str(guid or "")
+    if not s.startswith(_KUGOU_FEED_PREFIX):
+        return "", ""
+    rest = s[len(_KUGOU_FEED_PREFIX):]
+    kind, _, ident = rest.partition(":")
+    kind = kind.strip().lower()
+    if kind not in ("daily", "rank", "special"):
+        return "", ""
+    if kind != "daily" and not ident.strip():
+        return "", ""
+    return kind, ident.strip()
+
+
+def _feed_entry(kind: str, ident: str, name: str, cover: str, count: int) -> dict:
+    guid = kugou_feed_guid(kind, ident)
+    cover = str(cover or "").strip()
+    if cover:
+        # 登记进封面缓存：/static/cover 按 guid 直接命中，不必回源（省 20+ 次上游）。
+        remember_local_cover_url(guid, cover)
+    if len(_FEED_META) > 200:
+        _FEED_META.clear()
+    _FEED_META[guid] = {"name": name, "cover": cover, "count": int(count or 0)}
+    ts = int(time.time())
+    return {
+        "guid": guid,
+        "name": name,
+        "coverId": guid,
+        "coverUrl": cover,
+        "trackCount": int(count or 0),
+        "createdAt": ts,
+        "updatedAt": ts,
+        "source": "kugou",
+        "isKugouFeed": True,
+    }
+
+
+async def _feed_rank_counts(rankids: list[str]) -> dict[str, int]:
+    """榜单的曲目数：/rank/top 与 /rank/info 都不给，只能拿 /rank/audio 的 total。
+
+    size=1 只为读 total，不下载歌单；结果缓存 10 分钟，否则每次打开「我的歌单」
+    都要打 6 次上游。并发 + return_exceptions：任一榜失败都不许连累其余。
+    """
+    if not rankids:
+        return {}
+    now = time.time()
+    out: dict[str, int] = {}
+    todo: list[str] = []
+    for rid in rankids:
+        ent = _FEED_COUNT_CACHE.get(rid)
+        if ent and ent[0] > now:
+            out[rid] = ent[1]
+        else:
+            todo.append(rid)
+    if todo:
+        async def _one(rid: str):
+            payload = await kugou_source.fetch_rank_audio(rid, page=1, size=1)
+            return rid, int(payload.get("total") or 0)
+
+        for res in await asyncio.gather(*[_one(r) for r in todo], return_exceptions=True):
+            if isinstance(res, BaseException) or not isinstance(res, tuple):
+                logger.warning("[KUGOU_FEED] 榜单曲目数获取失败: %s", res)
+                continue
+            rid, total = res
+            if total > 0:
+                out[rid] = total
+                _FEED_COUNT_CACHE[rid] = (now + _FEED_COUNT_TTL, total)
+    return out
+
+
+async def fetch_kugou_feed_playlists() -> list[dict]:
+    """构造三个 feed 入口的虚拟歌单（列表页注入用）。
+
+    顺序：每日推荐 → 排行榜(N) → 精选歌单(N)。任一上游失败只影响自己那一组，
+    其余照常返回（不许因为 rank/top 挂了就把「每日推荐」也弄没）。
+    """
+    if not CONF.get("kugou_enabled", True) or not CONF.get("kugou_feed", True):
+        return []
+    out: list[dict] = []
+
+    # 1) 每日推荐：接口无分页，固定 30 首
+    out.append(_feed_entry("daily", "", "每日推荐", "", 30))
+
+    # 2) 排行榜：rankid 每天会变，必须实时取（硬编码的 id 第二天可能就空了）
+    try:
+        ranks = await kugou_source.fetch_rank_top()
+    except Exception as e:
+        logger.warning("[KUGOU_FEED] rank/top failed: %s", e)
+        ranks = []
+    ranks = [rk for rk in (ranks or [])[:_FEED_RANK_LIMIT] if str(rk.get("rankid") or "").strip()]
+    rank_counts = await _feed_rank_counts([str(rk.get("rankid")) for rk in ranks])
+    for rk in ranks:
+        rid = str(rk.get("rankid") or "").strip()
+        rname = str(rk.get("name") or "").strip()
+        out.append(_feed_entry("rank", rid,
+                               f"排行榜 · {rname}" if rname else f"排行榜 · {rid}",
+                               rk.get("cover") or "", rk.get("count") or rank_counts.get(rid) or 0))
+
+    # 3) 精选歌单
+    try:
+        payload = await kugou_source.fetch_top_playlists(page=1, size=40)
+    except Exception as e:
+        logger.warning("[KUGOU_FEED] top/playlist failed: %s", e)
+        payload = {"items": []}
+    specials = [x for x in (payload.get("items") or []) if isinstance(x, dict) and x.get("ident")]
+    for sp in specials[:_FEED_SPECIAL_LIMIT]:
+        sname = str(sp.get("name") or "").strip()
+        out.append(_feed_entry("special", str(sp.get("ident") or ""),
+                               f"精选 · {sname}" if sname else "精选歌单",
+                               sp.get("cover") or "", sp.get("count") or 0))
+
+    logger.warning("[KUGOU_FEED] 虚拟歌单 total=%d (rank=%d special=%d)",
+                   len(out), len(ranks or []), min(len(specials), _FEED_SPECIAL_LIMIT))
+    return out
+
+
+def kugou_feed_playlist_obj(guid: str) -> dict | None:
+    """feed guid -> 飞牛 playlist detail 对象（detail / batch-detail 共用，形状一致）。"""
+    kind, ident = parse_kugou_feed_guid(guid)
+    if not kind:
+        return None
+    meta = _FEED_META.get(guid) or {}
+    name = str(meta.get("name") or "").strip()
+    if not name:
+        base = {"daily": "每日推荐", "rank": "排行榜", "special": "精选歌单"}.get(kind, "歌单")
+        name = base if kind == "daily" else f"{base} · {ident}"
+    ts = int(time.time())
+    return {
+        "guid": guid,
+        "id": guid,
+        "name": name,
+        "title": name,
+        "coverId": guid,
+        "coverUrl": str(meta.get("cover") or ""),
+        "creator": "酷狗",
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": int(meta.get("count") or 0),
+        "collectionId": ident,
+        "source": "kugou",
+        "isKugouFeed": True,
+    }
 
 
 
@@ -783,6 +972,60 @@ async def fetch_kugou_playlist_tracks_full(app_state, guid: str) -> dict:
         "pagesize": page_size,
     }
 
+async def fetch_kugou_feed_tracks(guid: str, page: int = 1, size: int = 50) -> dict:
+    """feed guid -> {"items": [raw...], "total": n}；items 可直接喂 build_online_track。"""
+    kind, ident = parse_kugou_feed_guid(guid)
+    empty = {"items": [], "total": 0, "page": page, "pagesize": size}
+    if not kind:
+        return empty
+    try:
+        if kind == "daily":
+            payload = await kugou_source.fetch_daily_recommend()
+            items = payload.get("items") or []
+            if size and size > 0 and page >= 1:
+                start = (page - 1) * size
+                return {"items": items[start:start + size], "total": len(items),
+                        "page": page, "pagesize": size}
+            return {"items": items, "total": len(items), "page": 1, "pagesize": len(items)}
+        if kind == "rank":
+            return await kugou_source.fetch_rank_audio(ident, page=page, size=size)
+        return await kugou_source.fetch_collection_tracks(ident, page=page, size=size)
+    except Exception as e:
+        logger.warning("[KUGOU_FEED] tracks failed guid=%s err=%s", guid, e)
+        return empty
+
+
+async def fetch_kugou_feed_tracks_full(guid: str) -> dict:
+    """size=-1 全量。飞牛客户端进歌单默认一次拉全，不接这条就只有第一页。"""
+    kind, _ident = parse_kugou_feed_guid(guid)
+    if not kind:
+        return {"items": [], "total": 0, "page": 1, "pagesize": 0}
+    if kind == "daily":
+        return await fetch_kugou_feed_tracks(guid, page=1, size=-1)
+
+    page_size = 100
+    all_items: list[dict] = []
+    declared_total = 0
+    page = 1
+    while True:
+        payload = await fetch_kugou_feed_tracks(guid, page=page, size=page_size)
+        items = payload.get("items") or []
+        declared_total = int(payload.get("total") or declared_total)
+        if not items:
+            break
+        all_items.extend(items)
+        if len(all_items) >= declared_total:
+            break
+        if len(items) < page_size:
+            break
+        page += 1
+        if page > 30:      # 榜单最多 200 首，这里只是防跑飞
+            logger.warning("[KUGOU_FEED] full 停止翻页 page>30 guid=%s got=%d", guid, len(all_items))
+            break
+    return {"items": all_items, "total": declared_total or len(all_items),
+            "page": 1, "pagesize": page_size}
+
+
 # ===== KuGouMusicApi 源适配（新增）=====
 import kugou_source  # noqa: E402
 
@@ -820,6 +1063,9 @@ if _env_file.exists():
             _loaded_env[_k.strip()] = _v.strip()
         _KUGOU_KEY_MAP = {
             "FNMUSIC_KUGOU_ENABLED": ("kugou_enabled", "bool"),
+            # F-01 的开关必须回读：否则用户在 .env 写 FNMUSIC_FEED=0 后，
+            # 只要有人在设置页点一次保存，回读路径就会把它重置成默认 true。
+            "FNMUSIC_FEED": ("kugou_feed", "bool"),
             "FNMUSIC_KUGOU_URL": ("kugou_url", "str"),
             "FNMUSIC_KUGOU_QUALITY": ("kugou_quality", "str"),
             "FNMUSIC_KUGOU_TOKEN": ("kugou_token", "str"),
@@ -7908,16 +8154,40 @@ def filter_playlist_bundles(bundles: list[dict], guid: str, name: str) -> list[d
         return bundles
     kept: list[dict] = []
     dropped: list[str] = []
+    bad_guid: list[str] = []
+    feed_kept = 0
+    playlist_total = 0
     for b in bundles:
-        pid = kugou_playlist_id_from_guid(str(b.get("guid") or ""))
+        raw_guid = str(b.get("guid") or "")
+        # F-01 虚拟歌单（每日推荐/排行榜/精选）**不参与歌单映射**。
+        # 它们不是"用户歌单"，没有 kugou playlist id 可言 —— 实测
+        # kugou_playlist_id_from_guid("online:kugou:feed:daily") 返回空串，
+        # 空串在 whitelist 里必然不被允许，会让整组虚拟歌单被误删。
+        # 想关掉它们用开关 FNMUSIC_FEED=0，不是往白名单里加 feed guid。
+        if is_kugou_feed_guid(raw_guid):
+            kept.append(b)
+            feed_kept += 1
+            continue
+        playlist_total += 1
+        pid = kugou_playlist_id_from_guid(raw_guid)
+        if not pid:
+            # 解析不出 id = 上游给了脏数据。单独记，绝不许混进 drop=（那是 pid 列表）
+            bad_guid.append(raw_guid)
+            logger.warning("[PLAYLIST_MAP] 歌单 guid 无法解析出 id（上游脏数据？）guid=%r", raw_guid)
         if playlist_allow(rule, pid):
             kept.append(b)
-        else:
+        elif pid:
             dropped.append(pid)
-    if dropped:
-        # 这行是以后排查的唯一线索，别删
-        logger.info("[PLAYLIST_MAP] filtered %d/%d rule=%s mode=%s drop=%s",
-                    len(dropped), len(bundles), hit, rule.get("mode"), ",".join(dropped[:6]))
+    if dropped or bad_guid or feed_kept:
+        # 这行是以后排查的唯一线索，别删。字段约定（可机器切分）：
+        #   filtered <被删数>/<参与判定的歌单数>  —— 分母**不含** feed，别让人误读成"过滤了 feed"
+        #   drop=      只放真正的 pid，不含 guid、不含空串
+        #   feed=      放行的虚拟歌单条数；total= 传入总条数
+        #   drop_badguid= 仅在解析不出 pid 时出现（附加字段，正常情况没有）
+        logger.info("[PLAYLIST_MAP] filtered %d/%d rule=%s mode=%s drop=%s feed=%d total=%d%s",
+                    len(dropped), playlist_total, hit, rule.get("mode"),
+                    ",".join(dropped[:6]), feed_kept, len(bundles),
+                    (" drop_badguid=" + ",".join(bad_guid[:6])) if bad_guid else "")
     return kept
 
 
@@ -8416,6 +8686,16 @@ async def playlist_list(request: Request):
         except Exception as e:
             logger.warning("[KUGOU_PLAYLIST] list inject failed: %s", e)
 
+    # F-01：每日推荐 / 排行榜 / 精选歌单（虚拟歌单，排在用户歌单之前）
+    # 失败只影响这三组，绝不许把整个「我的歌单」搞空。
+    try:
+        feed_playlists = await fetch_kugou_feed_playlists()
+    except Exception as e:
+        logger.warning("[KUGOU_FEED] list inject failed: %s", e)
+        feed_playlists = []
+    if feed_playlists:
+        kugou_playlists = feed_playlists + list(kugou_playlists or [])
+
     now_ts = int(time.time())
     injected = [
         {
@@ -8477,6 +8757,12 @@ async def playlist_detail(request: Request):
     if not _is_get_request(request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = str(request.query_params.get("guid") or "").strip()
+
+    # F-01：虚拟歌单（每日推荐 / 排行榜 / 精选）先认，否则会落到下面
+    # is_kugou_playlist_guid 判定失败 → 透传上游 → 点进去空白。
+    if is_kugou_feed_guid(guid):
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": kugou_feed_playlist_obj(guid)})
+
     if not is_kugou_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -8524,8 +8810,13 @@ async def playlist_batch_detail(request: Request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
+    # F-01：虚拟歌单（每日推荐/排行榜/精选）的元数据全在本地构造，不打上游。
+    # 必须**先从 guids 里摘掉**，否则它们会落进 rest 分支被透传给上游。
+    feed_details = [o for o in (kugou_feed_playlist_obj(g) for g in guids if is_kugou_feed_guid(g)) if o]
+    if feed_details:
+        guids = [g for g in guids if not is_kugou_feed_guid(g)]
     kugou_ids = [g for g in guids if is_kugou_playlist_guid(g)]
-    if not kugou_ids:
+    if not kugou_ids and not feed_details:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     # F-03：先剔除当前用户看不到的歌单 —— 后面的 bundles 匹配与"回源酷狗 detail"
@@ -8594,7 +8885,7 @@ async def playlist_batch_detail(request: Request):
             if obj is not None:
                 kugou_details.append(obj)
 
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": kugou_details + official_list}})
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": feed_details + kugou_details + official_list}})
 
 
 @app.get("/music/api/v1/track/playlist-detail/list")
@@ -8607,9 +8898,26 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
+    # F-01：虚拟歌单（每日推荐/排行榜/精选）的真正出歌口。
+    # 不接这里 = 功能等于没做：客户端进歌单只打这个路由。
+    # size=-1（一次拉全）必须走 _full，否则只能看到第一页。
+    if is_kugou_feed_guid(guid):
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        size = _resolve_kugou_size(request.query_params.get("size"), default=50)
+        payload = (await fetch_kugou_feed_tracks_full(guid)) if size < 0 \
+            else (await fetch_kugou_feed_tracks(guid, page=page, size=size))
+        tracks = [build_online_track(x) for x in (payload.get("items") or []) if isinstance(x, dict)]
+        logger.warning("[KUGOU_FEED] track-list guid=%s page=%s size=%s got=%d total=%s",
+                       guid, page, size, len(tracks), payload.get("total"))
+        return JSONResponse(content={"code": 0, "msg": "ok",
+                                     "data": {"list": tracks,
+                                              "total": int(payload.get("total") or len(tracks))}})
+
     if not is_kugou_playlist_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
-
     # F-03：整张歌单的歌都从这个接口出。不拦的话 size=-1 一次就能拉完被屏蔽歌单。
     if playlist_map_active():
         user_guid, user_name = await resolve_playlist_user(request, get_upstream_client(request.app))

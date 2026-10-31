@@ -387,6 +387,9 @@ SAVE_LYRIC="$(env_flag   FNMUSIC_SAVE_WRITE_LYRIC 1)"
 # 默认开。写成 .env 里的一行是为了让用户能一眼看到、也能手工关掉排查问题；
 # 关掉的等价写法是 FNMUSIC_LOCAL_FIRST=0（重启生效）。
 LOCAL_FIRST="$(env_flag FNMUSIC_LOCAL_FIRST 1)"
+# F-01：每日推荐 / 排行榜 / 精选歌单（虚拟歌单）。默认开；关掉后「我的歌单」
+# 回到只有用户歌单 + 官方歌单，零额外上游请求（排查上游 500 时先关它）。
+FEED_ENABLED="$(env_flag FNMUSIC_FEED 1)"
 # 去重索引目录：默认留空，由 app.py 推导到落盘目录下的隐藏子目录
 # （跟着曲库走，覆盖安装/升级不会丢，也就不会把听过的歌再存一遍）。
 SAVE_MARKER="$(env_scalar FNMUSIC_SAVE_MARKER_DIR "")"
@@ -419,6 +422,7 @@ ENV_TMP="${ENV_FILE}.tmp.$$"
     echo "FNMUSIC_KUGOU_ENABLED=${KUGOU_ENABLED}"
     echo "FNMUSIC_KUGOU_URL=${KUGOU_URL}"
     echo "FNMUSIC_KUGOU_QUALITY=${KUGOU_QUALITY}"
+    echo "FNMUSIC_FEED=${FEED_ENABLED}"
     echo "FNMUSIC_KUGOU_SEARCH_TIMEOUT=${KUGOU_TIMEOUT}"
     echo "FNMUSIC_KUGOU_TOKEN=${TOKEN}"
     echo "FNMUSIC_KUGOU_USERID=${USERID}"

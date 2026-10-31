@@ -74,6 +74,10 @@ os.environ.update({
     "FNMUSIC_CACHE_DIR": str(ROOT / "cache"),
     "FNMUSIC_HOME_DIR": str(ROOT / "home"),
     "FNMUSIC_KUGOU_ENABLED": "1",
+    # 本文件测的是 F-03「按用户过滤歌单」，与 F-01 的虚拟歌单（每日推荐/榜单/
+    # 精选）无关。F-01 默认开会在列表里额外注入条目，让这里的"只有 N 条"
+    # 断言与阴性对照同时失真 —— 显式关掉，隔离被测行为。
+    "FNMUSIC_FEED": "0",
     "FNMUSIC_ETC_DIR": str(CONF),
     "FNMUSIC_VAR_DIR": str(ROOT / "fnmusic_kugou_pro" / "var"),
     "FNMUSIC_PKG_HOME_DIR": str(ROOT / "fnmusic_kugou_pro" / "home"),

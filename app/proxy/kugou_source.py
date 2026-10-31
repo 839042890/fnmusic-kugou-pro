@@ -1070,6 +1070,13 @@ def track_item_to_raw(it: dict) -> dict:
     artist = "、".join(singer_names)
     title = _strip_singer_prefix_from_name(str(it.get("name") or ""), singer_names, album)
     info_obj = it.get("info")
+    # ⚠️ timelen 的单位是**毫秒**（实测 /playlist/track/all：212898 = 3:32.898）。
+    # 变量名 `duration_s` 是历史遗留（早期误以为是秒），**它的值恒为毫秒**，
+    # 下游 build_online_track 的 audioSpec.duration 也要求毫秒
+    # （飞牛 music.db 的 track.duration_ms 就是毫秒，见 trim.music/target/sqlite.sql）。
+    # ⇒ 这里**绝不要**再除以 1000：那会让每首歌变成 0.2 秒左右。
+    # 全工程只有两处需要秒→毫秒换算，都写了注释：
+    #   search_item_to_raw 的 Duration（/search 回的是秒）与本文件 daily_item_to_raw 的 time_length。
     if isinstance(info_obj, dict):
         duration_s = _to_float(info_obj.get("timelen")) or _to_float(it.get("timelen"))
     else:
@@ -1697,3 +1704,370 @@ def save_credentials(user_data: dict) -> dict:
     CFG["kugou_dev"] = credentials["dev"]
     CFG["kugou_mac"] = credentials["mac"]
     return credentials
+# ============================================================
+# F-01 歌单类内容源：每日推荐 / 排行榜 / 精选歌单
+# ============================================================
+# 三个源的回包形状**各不相同**，不能共用 track_item_to_raw：
+#
+#   精选歌单 /playlist/track/all  data.songs[]     扁平：hash/name/singerinfo/timelen
+#   → 现有 track_item_to_raw 直接可用（本文件 1049 行）
+#
+#   每日推荐 /everyday/recommend  data.song_list[] 字段名全不同：
+#     songname（不是 name/audio_name）/ author_name / album_name / album_id
+#     hash_flac|hash_320|hash_128 / filesize_flac|320|128 / sizable_cover
+#     **time_length 单位是「秒」**（238 = 3:58），timelength_320 同样是秒
+#
+#   排行榜   /rank/audio          data.songlist[]  hash 与时长都嵌在 audio_info 里：
+#     audio_info.hash_128|320|flac / audio_info.duration_128|320|flac（毫秒）
+#     audio_info.filesize_* / album_info.album_name / album_info.sizable_cover
+#
+# ⇒ 三个 adapter 各自映射成同一套内部 raw，交给 build_online_track 出飞牛结构。
+#
+# 【单位约定 · 2026-10-31 实测，勿改】
+#   timelen / timelength / audio_info.duration_*  → **毫秒**
+#   /search 的 Duration、每日推荐的 time_length  → **秒**（各自映射里 ×1000）
+#   飞牛侧 music.db 的 track.duration_ms（trim.music/target/sqlite.sql:178）
+#   明确写「单位毫秒」⇒ 本地曲目与在线曲目量纲一致，这里不要再做任何换算。
+# ============================================================
+
+# 配置音质 -> 该源里可用的档位链（从高到低回退）。
+# 这三个源里**没有** hash_high（Hi-Res）字段，只有 128/320/flac，
+# 所以 high 与 flac 落到同一档是**有意的降级**，不是 bug。
+_FEED_HASH_TIERS = {
+    "high": ("flac", "320", "128"),
+    "flac": ("flac", "320", "128"),
+    "320": ("320", "128"),
+    "128": ("128",),
+}
+_FEED_SUFFIX = {"flac": "flac", "320": "mp3", "128": "mp3"}
+
+
+def _feed_quality_chain() -> tuple[str, ...]:
+    pref = str(CFG.get("kugou_quality") or "high").strip().lower()
+    return _FEED_HASH_TIERS.get(pref) or _FEED_HASH_TIERS["high"]
+
+
+def _feed_pick_tier(container: dict) -> tuple[str, str, int]:
+    """按配置音质在 hash_<tier> / filesize_<tier> 里挑一档。
+
+    返回 (tier, hash, filesize)。一个都没有时返回 ("", "", 0)，
+    由调用方决定是否回退到其他字段名。
+    """
+    if not isinstance(container, dict):
+        return "", "", 0
+    for tier in _feed_quality_chain():
+        h = str(container.get(f"hash_{tier}") or "").strip()
+        if h:
+            return tier, h, _to_int(container.get(f"filesize_{tier}") or 0)
+    return "", "", 0
+
+
+def _feed_artists(it: dict) -> list[dict]:
+    """歌手数组：author_name 可能是多人（"、"/","/"&" 分隔）。"""
+    singers = _singers_from_any(it)
+    if not singers:
+        name = str(it.get("author_name") or it.get("authorName") or "").strip()
+        if name:
+            singers = [{"name": p.strip(), "id": ""} for p in re.split(r"[、,，/&]", name) if p.strip()]
+    return singers
+
+
+def _feed_artist_name(singers: list[dict]) -> str:
+    return "、".join(str(x.get("name") or "").strip() for x in singers if isinstance(x, dict) and x.get("name"))
+
+
+def daily_item_to_raw(it: dict) -> dict:
+    """每日推荐 data.song_list[] → 内部统一 raw。
+
+    实测字段（/everyday/recommend，2026-10-31）：songname / author_name /
+    album_name / album_id / hash_flac|320|128 / filesize_flac|320|128 /
+    sizable_cover / **time_length（秒）**。
+
+    ⚠️ time_length 是秒：直接当毫秒用会让飞牛显示 0.238 秒。
+    这是全工程唯一一处「秒 → 毫秒」的换算点，改之前先看文件头的单位约定。
+    """
+    if not isinstance(it, dict):
+        return {}
+    tier, sid, filesize = _feed_pick_tier(it)
+    if not sid:
+        sid = str(it.get("hash") or it.get("hash_128") or "").strip()
+        filesize = filesize or _to_int(it.get("file_size") or it.get("filesize_128") or 0)
+    if not sid:
+        return {}
+    singers = _feed_artists(it)
+    singer_name = _feed_artist_name(singers)
+    album = str(it.get("album_name") or it.get("albumName") or "").strip()
+    raw_name = str(it.get("songname") or it.get("ori_audio_name") or it.get("filename") or "").strip()
+    title = _strip_singer_prefix_from_name(raw_name, [singer_name] if singer_name else [], album)
+    # 秒 → 毫秒（唯一一处）
+    duration_ms = _to_int(it.get("time_length") or it.get("timelength_320") or 0) * 1000
+    ext = _FEED_SUFFIX.get(tier or "", "mp3")
+    cover = str(it.get("sizable_cover") or it.get("cover") or "").strip()
+    return {
+        "id": f"kugou:{sid}",
+        "source": "kugou",
+        "hash": sid,
+        "title": title or raw_name,
+        "artist": singer_name,
+        "artists": singers,
+        "album": album,
+        "album_id": str(it.get("album_id") or it.get("albumID") or "").strip(),
+        "duration_s": float(duration_ms),   # 名字是历史遗留，值恒为**毫秒**
+        "ext": ext,
+        "cover_url": cover,
+        "union_cover": cover,
+        "file_size": filesize,
+        "bitrate": _to_int(it.get("bitrate") or 0),
+        "lyric": "",
+        "release_date": str(it.get("publish_time") or it.get("publish_date") or "").strip(),
+    }
+
+
+def rank_item_to_raw(it: dict) -> dict:
+    """排行榜 data.songlist[] → 内部统一 raw。
+
+    实测字段（/rank/audio，2026-10-31）：hash 与时长都在 audio_info 里，
+    顶层没有 hash —— 先判 hash 的通用映射会直接返回空。
+
+      audio_info.hash_128|hash_320|hash_flac
+      audio_info.duration_128|320|flac（**毫秒**，与 timelen 同量纲）
+      audio_info.filesize_flac|320|128
+      album_info.album_name / album_info.sizable_cover
+      album_id / album_audio_id / author_name / songname
+    """
+    if not isinstance(it, dict):
+        return {}
+    audio = it.get("audio_info") if isinstance(it.get("audio_info"), dict) else {}
+    alb = it.get("album_info") if isinstance(it.get("album_info"), dict) else {}
+    tier, sid, filesize = _feed_pick_tier(audio)
+    if not sid:
+        sid = str(audio.get("hash") or it.get("hash") or "").strip()
+        filesize = filesize or _to_int(audio.get("filesize") or audio.get("size") or 0)
+    if not sid:
+        return {}
+    duration_ms = _to_int(
+        audio.get(f"duration_{tier}") if tier else 0
+    ) or _to_int(
+        audio.get("duration_flac") or audio.get("duration_320")
+        or audio.get("duration_128") or audio.get("duration") or 0
+    )
+    singers = _feed_artists(it)
+    if not singers and isinstance(it.get("authors"), list):
+        singers = [{"name": str(x.get("author_name") or x.get("name") or "").strip(),
+                    "id": str(x.get("author_id") or x.get("id") or "").strip()}
+                   for x in it.get("authors") if isinstance(x, dict)]
+    singer_name = _feed_artist_name(singers)
+    album = str(alb.get("album_name") or it.get("album_name") or "").strip()
+    raw_name = str(it.get("songname") or it.get("audio_name") or "").strip()
+    title = _strip_singer_prefix_from_name(raw_name, [singer_name] if singer_name else [], album)
+    cover = str(alb.get("sizable_cover") or alb.get("cover") or "").strip()
+    if not cover:
+        cover = _cover_from_any(it)
+    ext = _FEED_SUFFIX.get(tier or "", "mp3")
+    bitrate = _to_int(audio.get(f"bitrate_{tier}") if tier else 0) or _to_int(audio.get("bitrate") or 0)
+    return {
+        "id": f"kugou:{sid}",
+        "source": "kugou",
+        "hash": sid,
+        "title": title or raw_name,
+        "artist": singer_name,
+        "artists": singers,
+        "album": album,
+        "album_id": str(it.get("album_id") or alb.get("album_id") or "").strip(),
+        "duration_s": float(duration_ms),   # 历史命名，值恒为**毫秒**
+        "ext": ext,
+        "cover_url": cover,
+        "union_cover": cover,
+        "file_size": filesize,
+        "bitrate": bitrate,
+        "lyric": "",
+        "release_date": str(it.get("publish_time") or "").strip(),
+    }
+
+
+def special_item_to_raw(it: dict) -> dict:
+    """精选歌单 data.songs[] → 内部统一 raw（形状与 /playlist/track/all 一致）。
+
+    实测可用，直接复用 track_item_to_raw，保留同名入口只为三个源对称。
+    """
+    return track_item_to_raw(it)
+
+
+async def _feed_get(path: str, params: dict | None, tag: str) -> dict | None:
+    """F-01 三个源的统一取数外壳：统一日志 + 统一吞异常（列表页宁可空，不许 500）。"""
+    try:
+        async with _client() as c:
+            r = await c.get(path, params=params or {})
+            if r.status_code != 200:
+                logger.warning("[KUGOU][%s] http=%s body=%r", tag, r.status_code, r.text[:200])
+                return None
+            body = r.json()
+            if not isinstance(body, dict):
+                logger.warning("[KUGOU][%s] body type=%s body=%r", tag, type(body).__name__, str(body)[:200])
+                return None
+            return body
+    except Exception as e:
+        logger.warning("[KUGOU][%s] error: %s", tag, e)
+        return None
+
+
+async def fetch_daily_recommend(page: int = 1, size: int = 30) -> dict:
+    """每日推荐：GET /everyday/recommend。
+
+    该接口**没有分页参数**，固定回 30 首，按 data.creation_date 每天变一次
+    （所以缓存要按日期，别用固定 TTL 跨天）。/recommend/songs 与它同源
+    （hash 序列 30/30 相同、顺序一致），因此**不另做第二个入口**。
+    """
+    empty = {"items": [], "total": 0, "page": 1, "pagesize": 30, "creation_date": ""}
+    body = await _feed_get("/everyday/recommend", None, "FEED_DAILY")
+    if not body:
+        return empty
+    data = body.get("data")
+    creation = ""
+    if isinstance(data, dict):
+        raw = data.get("song_list") or data.get("songList") or data.get("list") or []
+        creation = str(data.get("creation_date") or data.get("creationDate") or "")
+    elif isinstance(data, list):
+        raw = data
+    else:
+        return empty
+    items = []
+    for it in raw if isinstance(raw, list) else []:
+        raw_item = daily_item_to_raw(it)
+        if not raw_item:
+            continue
+        items.append(raw_item)
+        _remember_song(raw_item)
+    logger.warning("[KUGOU][FEED_DAILY] creation_date=%s got=%d", creation or "(none)", len(items))
+    return {"items": items, "total": len(items), "page": 1, "pagesize": 30, "creation_date": creation}
+
+
+async def fetch_rank_top() -> list[dict]:
+    """排行榜入口用 /rank/top，**不是** /rank/list。
+
+    实测（2026-10-31）：/rank/list 的 55 个 info[].id 当 rankid 传，抽样 6 个只有
+    id=2(TOP500) 能出歌，其余全空；/rank/top 回的 rankid 才带满内容。
+    另外 rankid **会随日期变化**（今天 6 个 = 84235/85432/33165/59896/33163/35811），
+    所以必须每次实时取，**不要硬编码**。
+    """
+    body = await _feed_get("/rank/top", None, "FEED_RANK_TOP")
+    if not body:
+        return []
+    data = body.get("data")
+    raw = []
+    if isinstance(data, dict):
+        for key in ("list", "info", "data", "ranks", "rank_list"):
+            v = data.get(key)
+            if isinstance(v, list):
+                raw = v
+                break
+    elif isinstance(data, list):
+        raw = data
+    out = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        rid = str(it.get("rankid") or it.get("rankId") or it.get("id") or "").strip()
+        if not rid:
+            continue
+        out.append({
+            "rankid": rid,
+            "name": str(it.get("rankname") or it.get("name") or it.get("title") or "").strip(),
+            "cover": str(it.get("imgurl") or it.get("img") or it.get("cover") or "").strip(),
+            "count": _to_int(it.get("song_count") or it.get("count") or 0),
+        })
+    logger.warning("[KUGOU][FEED_RANK_TOP] n=%d ids=%s", len(out), [x["rankid"] for x in out])
+    return out
+
+
+async def fetch_rank_audio(rankid: int | str, page: int = 1, size: int = 100) -> dict:
+    """榜内歌曲：GET /rank/audio?rankid=&page=&pagesize=（data.songlist[]）。"""
+    rid = str(rankid or "").strip()
+    empty = {"items": [], "total": 0, "page": page, "pagesize": size, "rankid": rid}
+    if not rid:
+        return empty
+    body = await _feed_get("/rank/audio", {"rankid": rid, "page": page, "pagesize": size}, "FEED_RANK_AUDIO")
+    if not body:
+        return empty
+    data = body.get("data") or {}
+    raw = data.get("songlist") or data.get("songList") or data.get("list") or []
+    items = []
+    for it in raw if isinstance(raw, list) else []:
+        raw_item = rank_item_to_raw(it)
+        if not raw_item:
+            continue
+        items.append(raw_item)
+        _remember_song(raw_item)
+    total = _to_int(data.get("total") or 0) or len(items)
+    logger.warning("[KUGOU][FEED_RANK_AUDIO] rankid=%s page=%s size=%s got=%d total=%s",
+                   rid, page, size, len(items), total)
+    return {"items": items, "total": total, "page": page, "pagesize": size, "rankid": rid}
+
+
+async def fetch_top_playlists(page: int = 1, size: int = 40) -> dict:
+    """精选歌单列表：GET /top/playlist?page=&pagesize=（data.special_list[]）。
+
+    实测 pagesize 硬上限 40（传 100 也只回 40），翻页看 data.has_next。
+    注意 ident 必须用 global_collection_id（collection_3_..._0），
+    传 specialid 给 /playlist/track/all 会直接 502。
+    """
+    empty = {"items": [], "total": 0, "page": page, "pagesize": 40, "has_next": False}
+    body = await _feed_get("/top/playlist", {"page": page, "pagesize": size}, "FEED_TOP_PLAYLIST")
+    if not body:
+        return empty
+    data = body.get("data") or {}
+    raw = data.get("special_list") or data.get("list") or []
+    out = []
+    for it in raw if isinstance(raw, list) else []:
+        if not isinstance(it, dict):
+            continue
+        gcid = str(it.get("global_collection_id") or it.get("globalCollectionId") or "").strip()
+        if not gcid:
+            continue
+        out.append({
+            "ident": gcid,
+            "name": str(it.get("specialname") or it.get("name") or "").strip(),
+            "cover": str(it.get("imgurl") or it.get("cover") or "").strip(),
+            "creator": str(it.get("nickname") or "").strip(),
+            "count": _to_int(it.get("percount") or it.get("songcount") or 0),
+        })
+    logger.warning("[KUGOU][FEED_TOP_PLAYLIST] page=%s got=%d has_next=%s",
+                   page, len(out), data.get("has_next"))
+    return {"items": out, "total": len(out), "page": page, "pagesize": 40,
+            "has_next": bool(data.get("has_next"))}
+
+
+async def fetch_collection_tracks(gcid: int | str, page: int = 1, size: int = 100) -> dict:
+    """精选歌单曲目：GET /playlist/track/all?id=<global_collection_id>&page=&pagesize=。
+
+    实测 pagesize=300 也能一次拉回整张（214 首），但为了不给上游一次压太多，
+    app 侧统一按 100 分页循环。
+    """
+    ident = str(gcid or "").strip()
+    empty = {"items": [], "total": 0, "page": page, "pagesize": size, "collection_id": ident}
+    if not ident:
+        return empty
+    body = await _feed_get("/playlist/track/all", {"id": ident, "page": page, "pagesize": size},
+                           "FEED_COLLECTION_TRACKS")
+    if not body:
+        return empty
+    data = body.get("data") or {}
+    if isinstance(data, list):
+        data = {"songs": data}
+    raw = data.get("songs") or data.get("list") or data.get("info") or []
+    items = []
+    for it in raw if isinstance(raw, list) else []:
+        raw_item = special_item_to_raw(it)
+        if not raw_item:
+            continue
+        items.append(raw_item)
+        _remember_song(raw_item)
+    # 上游把总数放在 data.count（实测 collection_..._373_0 → count=126），
+    # 而 data.total 不存在。只读 total 会让分页 total 退化成"本页条数"，
+    # 连带 size=-1 的全量循环在第一页就以为拉完了（126 首只拿到 100）。
+    total = (_to_int(data.get("count") or 0)
+             or _to_int(data.get("total") or 0)
+             or len(items))
+    logger.warning("[KUGOU][FEED_COLLECTION_TRACKS] gcid=%s page=%s size=%s got=%d total=%s",
+                   ident, page, size, len(items), total)
+    return {"items": items, "total": total, "page": page, "pagesize": size, "collection_id": ident}
