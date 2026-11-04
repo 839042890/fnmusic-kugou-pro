@@ -2103,10 +2103,10 @@ async def fetch_kugou_artist_search(app_state, keyword: str, page: int = 1, size
                                r.status_code, kw, r.text[:200])
                 return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
             body = r.json()
-            status = body.get("status", body.get("error_code"))
-            if status not in (1, 0, 200, None):
-                logger.warning("[KUGOU_ARTIST_SEARCH] status=%s kw=%r errmsg=%r",
-                               status, kw, body.get("error_msg"))
+            # 先 error_code 后 status（status=0 是失败态），见 kugou_source.envelope_state
+            if kugou_source.envelope_state(body) != "valid":
+                logger.warning("[KUGOU_ARTIST_SEARCH] %s kw=%r errmsg=%r",
+                               kugou_source.envelope_detail(body), kw, body.get("error_msg"))
                 return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
             data = body.get("data") or {}
             lists = data.get("lists") or [] if isinstance(data, dict) else []
@@ -2307,10 +2307,10 @@ async def fetch_kugou_playlist_search(app_state, keyword: str, page: int = 1, si
                                r.status_code, kw, r.text[:200])
                 return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
             body = r.json()
-            status = body.get("status", body.get("error_code"))
-            if status not in (1, 0, 200, None):
-                logger.warning("[KUGOU_PLAYLIST_SEARCH] status=%s kw=%r errmsg=%r",
-                               status, kw, body.get("error_msg"))
+            # 先 error_code 后 status（status=0 是失败态），见 kugou_source.envelope_state
+            if kugou_source.envelope_state(body) != "valid":
+                logger.warning("[KUGOU_PLAYLIST_SEARCH] %s kw=%r errmsg=%r",
+                               kugou_source.envelope_detail(body), kw, body.get("error_msg"))
                 return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
             data = body.get("data") or {}
             lists = data.get("lists") or [] if isinstance(data, dict) else []
@@ -9102,6 +9102,9 @@ async def login_qr_check(key: str):
             "kugou_mac": CONF["kugou_mac"],
         })
         
+        # 刚换了凭证：探活结论必须作废，否则旧缓存会让设置页继续显示"已失效"
+        kugou_source.invalidate_login_probe()
+        
         return JSONResponse({
             "status": "authenticated",
             "nickname": result.get("nickname", ""),
@@ -9119,16 +9122,38 @@ async def login_qr_check(key: str):
 
 @app.get("/_ext/login/status")
 async def login_status():
-    """查询当前登录状态"""
+    """查询当前登录状态（含轻量探活，P-07）。
+
+    只判「有没有存 token」是不够的：token 在服务端失效后这里仍然显示已登录，
+    用户只能靠"歌单怎么空了"自己发现。现在每 10 分钟探活一次上游。
+    """
     if not CONF["kugou_token"]:
-        return JSONResponse({"status": "not_logged_in"})
-    return JSONResponse({
-        "status": "logged_in",
+        return JSONResponse({"status": "not_logged_in", "token_state": "none"})
+    try:
+        probe = await kugou_source.probe_login_state()
+    except Exception as e:  # 探活自身出错不能变成"登录失效"
+        logger.warning("[LOGIN_STATUS] probe failed: %s", e)
+        probe = {"state": "unknown", "detail": type(e).__name__}
+    state = probe.get("state") or "unknown"
+    payload = {
         "userid": CONF["kugou_userid"],
         "has_token": bool(CONF["kugou_token"]),
         "has_userid": bool(CONF["kugou_userid"]),
         "has_dfid": bool(CONF["kugou_dfid"]),
-    })
+        "token_state": state,
+    }
+    if state == "invalid":
+        # 不自动清凭证：失效 ≠ 注销，用户重新扫码覆盖即可
+        payload.update({
+            "status": "token_invalid",
+            "message": "登录已失效，请重新扫码",
+            "probe_status": probe.get("status"),
+            "probe_error_code": probe.get("error_code"),
+        })
+        return JSONResponse(payload)
+    payload["status"] = "logged_in"
+    payload["probe_cached"] = bool(probe.get("cached"))
+    return JSONResponse(payload)
 
 
 @app.post("/_ext/login/logout")
@@ -9155,6 +9180,8 @@ async def login_logout():
         "kugou_dev": "",
         "kugou_mac": "",
     })
+    # 退出后不能留着上一次的探活结论
+    kugou_source.invalidate_login_probe()
     
     # 清除 .env 中的凭证（统一入口：原子替换 + chmod 600）
     cleared = {k: "" for k in (

@@ -91,6 +91,52 @@ def _client() -> httpx.AsyncClient:
 
 
 # ============================================================
+# 回包信封判定（status 与 error_code 必须分开读）
+# ============================================================
+
+# 20010 = 缺参数（探活请求总是带齐 token/userid，出现它就说明凭证本身不可用）
+# 20017 = 凭证不可用：token 假/短/非 hex、缺 userid、userid 不存在，全回这个码
+# 20018 = /user/detail 上观察到的失效码
+# 实测（2026-11-04，hermes）：正常 = status:1 error_code:0；失败 = status:0 + error_code:<码>
+_INVALID_ERROR_CODES = (20010, 20017, 20018)
+
+
+def envelope_state(body: Any) -> str:
+    """判断 KuGouMusicApi 的统一回包信封：valid / invalid / unknown。
+
+    **必须分开读 status 与 error_code。** 历史写法
+    ``body.get("status", body.get("error_code"))`` 里 ``status`` 键恒存在
+    （失败时是 0），``error_code`` 那半边永远读不到，于是「status=0 + error_code=20017」
+    会被判成成功。判定顺序必须是**先 error_code 后 status**：``status=0`` 是失败态，
+    只有 ``error_code==0 且 status==1`` 才算成功。
+
+    unknown 的含义是「没结论」：既不能当成功，也不能当凭证失效（上游抖动时误报失效
+    会把用户推去白扫一次码）。
+    """
+    if not isinstance(body, dict) or not body:
+        # 空回包单独判：更可能是网关错误页/空响应，当"成功"会把上游坏了看成调用成功
+        return "unknown"
+    ec = body.get("error_code")
+    st = body.get("status")
+    if ec in _INVALID_ERROR_CODES:
+        return "invalid"
+    if ec == 0 and st == 1:
+        return "valid"
+    # 兼容旧口径：信封本身正常（success 码是 200），不算失败。
+    # 注意 **不含 st=None**（键缺失）与 status=0 —— 它们落到下面的 unknown。
+    if ec in (0, None) and st in (1, 200):
+        return "valid"
+    return "unknown"
+
+
+def envelope_detail(body: Any) -> str:
+    """回包信封的日志摘要（只有码值，不含任何凭证）。"""
+    if not isinstance(body, dict):
+        return f"body_type={type(body).__name__}"
+    return f"status={body.get('status')} error_code={body.get('error_code')}"
+
+
+# ============================================================
 # 内存索引：搜索时缓存，get_info 命中时直接返回元数据
 # ============================================================
 
@@ -531,10 +577,10 @@ async def search_albums_raw(keyword: str, limit: int = 30, page: int = 1) -> dic
                                r.status_code, kw, r.text[:200])
                 return {"lists": [], "total": 0, "page": page, "pagesize": limit, "keyword": kw}
             body = r.json()
-            status = body.get("status", body.get("error_code"))
-            if status not in (1, 0, 200, None):
-                logger.warning("[KUGOU] search/type=album status=%s kw=%r errmsg=%r",
-                               status, kw, body.get("error_msg"))
+            # 先 error_code 后 status（status=0 是失败态），见 envelope_state 注释
+            if envelope_state(body) != "valid":
+                logger.warning("[KUGOU] search/type=album %s kw=%r errmsg=%r",
+                               envelope_detail(body), kw, body.get("error_msg"))
                 return {"lists": [], "total": 0, "page": page, "pagesize": limit, "keyword": kw}
             data = body.get("data") or {}
             lists = data.get("lists") or [] if isinstance(data, dict) else []
@@ -595,11 +641,11 @@ async def get_album_songs(album_id: int | str, page: int = 1, pagesize: int = 50
                                r.status_code, aid, r.text[:200])
                 return empty
             body = r.json()
-            status = body.get("status", body.get("error_code"))
             errmsg = body.get("errmsg") or body.get("error_msg") or ""
-            if status not in (1, 0, 200, None):
-                logger.warning("[KUGOU] album/songs status=%s album=%s errmsg=%r",
-                               status, aid, errmsg)
+            # 先 error_code 后 status（status=0 是失败态），见 envelope_state 注释
+            if envelope_state(body) != "valid":
+                logger.warning("[KUGOU] album/songs %s album=%s errmsg=%r",
+                               envelope_detail(body), aid, errmsg)
                 return empty
             data = body.get("data") or {}
             # 嵌套结构：data.songs / data.songList / data.list / data.lists
@@ -807,10 +853,10 @@ async def get_album_detail(album_id: int | str) -> dict:
                 logger.warning("[KUGOU] album/detail body type=%s album_id=%s body=%r",
                                type(body).__name__, aid, str(body)[:200])
                 return {}
-            status = body.get("status", body.get("error_code"))
-            if status not in (1, 0, 200, None):
-                logger.warning("[KUGOU] album/detail status=%s album_id=%s errmsg=%r",
-                               status, aid, body.get("errmsg"))
+            # 先 error_code 后 status（status=0 是失败态），见 envelope_state 注释
+            if envelope_state(body) != "valid":
+                logger.warning("[KUGOU] album/detail %s album_id=%s errmsg=%r",
+                               envelope_detail(body), aid, body.get("errmsg"))
                 return {}
             data = body.get("data") or []
             if isinstance(data, dict):
@@ -855,9 +901,9 @@ async def get_artist_albums(artist_id: int | str, page: int = 1, pagesize: int =
             if not isinstance(body, dict):
                 logger.warning("[KUGOU] artist/albums body type=%s aid=%s body=%r", type(body).__name__, aid, str(body)[:200])
                 return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
-            status = body.get("status", body.get("error_code"))
-            if status not in (1, 0, 200, None):
-                logger.warning("[KUGOU] artist/albums status=%s aid=%s errmsg=%r", status, aid, body.get("errmsg"))
+            # 先 error_code 后 status（status=0 是失败态），见 envelope_state 注释
+            if envelope_state(body) != "valid":
+                logger.warning("[KUGOU] artist/albums %s aid=%s errmsg=%r", envelope_detail(body), aid, body.get("errmsg"))
                 return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
             data = body.get("data") or []
             if isinstance(data, dict):
@@ -1333,6 +1379,88 @@ async def get_user_playlists(page: int = 1, pagesize: int = 500) -> dict:
     except Exception as e:
         logger.warning("[KUGOU] user_playlist error: %s", e)
         return {"items": [], "total": 0, "page": page, "pagesize": pagesize}
+
+
+# ============================================================
+# 登录态探活（P-07）
+# ============================================================
+# 只判「有没有存 token」不够：token 服务端失效后界面仍显示已登录，
+# 用户只能靠「歌单怎么空了」自己发现。这里做一次轻量探活。
+_LOGIN_PROBE_TTL_S = 600.0          # valid / invalid 缓存 10 分钟
+_LOGIN_PROBE_TTL_UNKNOWN_S = 30.0   # 没结论只压 30 秒：上游一恢复就能反映
+_LOGIN_PROBE_TIMEOUT_S = 5.0        # 固定 5s，**不跟** kugou_search_timeout(15s) 走
+_login_probe_cache: dict[str, Any] = {"at": 0.0, "ttl": 0.0, "result": None}
+
+
+def invalidate_login_probe() -> None:
+    """清掉探活缓存。扫码成功 / 退出登录后必须调用，否则最多 10 分钟内还是旧结论。"""
+    _login_probe_cache.update({"at": 0.0, "ttl": 0.0, "result": None})
+    logger.info("[KUGOU] login_probe cache invalidated")
+
+
+async def probe_login_state(force: bool = False) -> dict:
+    """探活一次登录态，返回 {"state", "status", "error_code", "detail", "checked_at", "cached"}。
+
+    state 取值：
+      valid   —— error_code==0 且 status==1（信封正常）
+      invalid —— error_code in (20010, 20017, 20018)，即**凭证不可用**
+                 （token 失效、token 格式错、userid 缺失/不存在都算）
+      unknown —— 上游超时/不可达/HTTP≠200/JSON 坏/status=0 但码值不认识。
+                 **绝不能把 unknown 当失效**，否则会把用户推去白扫一次码。
+      skipped —— kugou_enabled=0，不发请求
+    """
+    now = time.monotonic()
+    cached = _login_probe_cache["result"]
+    if not force and cached is not None and (now - _login_probe_cache["at"]) < _login_probe_cache["ttl"]:
+        return {**cached, "cached": True}
+
+    if not CFG.get("kugou_enabled", True):
+        # 配置层已确认禁用，没必要打上游；也不缓存（开关随时会变）
+        return {"state": "skipped", "status": None, "error_code": None,
+                "detail": "kugou disabled", "checked_at": time.time(), "cached": False}
+
+    started = time.monotonic()
+    st: Any = None
+    ec: Any = None
+    state = "unknown"
+    detail = ""
+    try:
+        async with _client() as c:
+            r = await c.get("/user/playlist", params={"page": 1, "pagesize": 1},
+                            timeout=_LOGIN_PROBE_TIMEOUT_S)
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        if r.status_code != 200:
+            detail = f"http={r.status_code}"
+        elif not isinstance(body, dict):
+            detail = "bad json"
+        else:
+            st, ec = body.get("status"), body.get("error_code")
+            state = envelope_state(body)
+            detail = envelope_detail(body)
+    except Exception as e:  # 超时 / 连不上 / DNS 等，一律 unknown
+        detail = f"{type(e).__name__}: {e}"
+    elapsed = time.monotonic() - started
+
+    if state == "valid":
+        logger.info("[KUGOU] login_probe valid (%s) elapsed=%.2fs", detail, elapsed)
+        ttl = _LOGIN_PROBE_TTL_S
+    elif state == "invalid":
+        # 20017 也涵盖「userid 不对」，所以统一写 invalid credentials，别写 token invalid
+        logger.info("[KUGOU] login_probe invalid credentials (%s) elapsed=%.2fs", detail, elapsed)
+        ttl = _LOGIN_PROBE_TTL_S
+    else:
+        # unknown 必须留下原始码值，将来出现没见过的码才能被发现
+        logger.info("[KUGOU] login_probe unknown status=%s error_code=%s detail=%s elapsed=%.2fs",
+                    st, ec, detail, elapsed)
+        ttl = _LOGIN_PROBE_TTL_UNKNOWN_S
+
+    result = {"state": state, "status": st, "error_code": ec,
+              "detail": detail, "checked_at": time.time()}
+    _login_probe_cache.update({"at": time.monotonic(), "ttl": ttl, "result": result})
+    return {**result, "cached": False}
 
 
 async def _refresh_privilege_tier(song_id: str, base_info: dict) -> dict | None:
