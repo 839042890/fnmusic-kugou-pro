@@ -79,7 +79,102 @@ def _forward_body(sock: socket.socket, content_length: int, out: socket.socket) 
     _forward_body_with_pre(sock, content_length, out, b"")
 
 
-def _forward_response(upstream: socket.socket, out: socket.socket) -> None:
+_RESP_HEAD_END = b"\r\n\r\n"
+_RESP_HEAD_MAX = 256 * 1024
+
+
+def _read_response_head(upstream: socket.socket, pre: bytes = b"") -> tuple[bytes, bytes]:
+    """读到响应头结束（\\r\\n\\r\\n），返回 (含结尾的 head, 顺带多读到的 body 前缀)。
+
+    多读出来的字节必须原样交给调用方转出去，丢了就是损坏（body 开头少一段）。
+    """
+    # pre 是上一轮已读进来、还没消耗的字节（1xx 要连读两个响应头）：
+    # 必须先接上再找分隔符，否则会拿已读缓冲去等一段永远不会再来的数据。
+    buf = pre
+    while _RESP_HEAD_END not in buf:
+        chunk = upstream.recv(8192)
+        if not chunk:
+            raise ConnectionError("upstream closed before response header")
+        buf += chunk
+        if len(buf) > _RESP_HEAD_MAX:
+            raise ConnectionError("response header too large")
+    head, _, rest = buf.partition(_RESP_HEAD_END)
+    return head + _RESP_HEAD_END, rest
+
+
+def _parse_response_head(head: bytes) -> tuple[int, dict[str, str]]:
+    """从响应头里取 (status, headers)。header 名统一小写，值去首尾空白。"""
+    lines = head.decode("latin1", errors="replace").split("\r\n")
+    try:
+        status = int(lines[0].split(" ")[1])
+    except (IndexError, ValueError):
+        status = 0
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+    return status, headers
+
+
+def _pump_exact(upstream: socket.socket, out: socket.socket, total: int, pre: bytes) -> None:
+    """把恰好 total 字节原样转出去：先发已读到的 pre，再补读剩下的。"""
+    sent = 0
+    if pre:
+        out.sendall(pre)
+        sent = len(pre)
+    while sent < total:
+        chunk = upstream.recv(min(65536, total - sent))
+        if not chunk:
+            raise ConnectionError("upstream closed before content-length satisfied")
+        out.sendall(chunk)
+        sent += len(chunk)
+
+
+def _forward_response(upstream: socket.socket, out: socket.socket, method: str = "GET") -> None:
+    """把上游响应转给客户端。
+
+    **历史实现无条件 recv 到 EOF，于是被 uvicorn 的 keep-alive 拖住：**
+    响应体 8 毫秒就发完了，但 uvicorn 默认 `--timeout-keep-alive 5`，发完 body 不关连接，
+    桥接器一直 recv 到 EOF 才返回 ⇒ 每个经 /app/fnmusic_kugou_pro/* 的请求都白等 5 秒
+    （手机端、网关都跟着等）。
+
+    现在先解析响应头，**收满 Content-Length 就返回**，不等对端关连接：
+      · 1xx（100 Continue 之类）不是终态 —— 转出去，继续读真正的响应头；
+      · HEAD / 204 / 304 按 RFC 7230 §3.3.3 没有 body —— 发完头就收尾；
+      · chunked / 无 Content-Length（流式响应）—— 退回原来的 EOF 逻辑，行为不变。
+    """
+    head, rest = _read_response_head(upstream)
+    status, headers = _parse_response_head(head)
+    hops = 0  # 上限防对端一直吐 1xx 把这里变成死循环
+    while 100 <= status < 200 and hops < 8:
+        hops += 1
+        out.sendall(head)
+        head, rest = _read_response_head(upstream, rest)
+        status, headers = _parse_response_head(head)
+
+    out.sendall(head)
+
+    if method.upper() == "HEAD" or status in (204, 304):
+        log.debug("<- head-only response (%d), done", status)
+        return
+
+    transfer_encoding = (headers.get("transfer-encoding") or "").lower()
+    if "chunked" not in transfer_encoding:
+        raw_len = headers.get("content-length")
+        if raw_len is not None:
+            try:
+                total = int(raw_len)
+            except ValueError:
+                total = -1
+            if total >= 0:
+                _pump_exact(upstream, out, total, rest)
+                log.debug("<- content-length %d satisfied, done", total)
+                return
+
+    # 无长度 / chunked：保持原行为（等到对端关连接）
+    if rest:
+        out.sendall(rest)
     while True:
         chunk = upstream.recv(65536)
         if not chunk:
@@ -148,7 +243,7 @@ def _handle(client: socket.socket, client_addr, rest_b: bytes) -> None:
                      request_line.split()[0], path, clen, len(rest))
             _forward_body_with_pre(client, clen, upstream, rest.encode("latin1", errors="replace"))
             log.debug("-> body sent, waiting response")
-            _forward_response(upstream, client)
+            _forward_response(upstream, client, request_line.split()[0])
             log.debug("-> response sent, done")
         finally:
             try:

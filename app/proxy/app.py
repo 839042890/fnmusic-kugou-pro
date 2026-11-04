@@ -8686,7 +8686,7 @@ async def playlist_list(request: Request):
         except Exception as e:
             logger.warning("[KUGOU_PLAYLIST] list inject failed: %s", e)
 
-    # F-01：每日推荐 / 排行榜 / 精选歌单（虚拟歌单，排在用户歌单之前）
+    # F-01：每日推荐 / 排行榜 / 精选歌单（虚拟歌单，排在用户歌单**之后**）
     # 失败只影响这三组，绝不许把整个「我的歌单」搞空。
     try:
         feed_playlists = await fetch_kugou_feed_playlists()
@@ -8694,7 +8694,9 @@ async def playlist_list(request: Request):
         logger.warning("[KUGOU_FEED] list inject failed: %s", e)
         feed_playlists = []
     if feed_playlists:
-        kugou_playlists = feed_playlists + list(kugou_playlists or [])
+        # 真实歌单在前、虚拟歌单在后：用户自己的 5 个歌单是他每天要点开的东西，
+        # 27 个虚拟歌单是"逛一逛"的入口，压在前面会把真实歌单挤到第二屏。
+        kugou_playlists = list(kugou_playlists or []) + feed_playlists
 
     now_ts = int(time.time())
     injected = [
@@ -9421,15 +9423,21 @@ async def _save_settings_impl(form):
                 env_content[k.strip()] = v.strip()
 
     if "kugou_url" in form:
-        value = _sanitize_kugou_url(form["kugou_url"])
-        if not value:
-            return JSONResponse(
-                {"status": "error", "message": "KuGouMusicApi 地址必须以 http:// 或 https:// 开头"},
-                status_code=400,
-            )
-        env_content["FNMUSIC_KUGOU_URL"] = value
-        CONF["kugou_url"] = value
-        kugou_source.set_config({"kugou_url": value})
+        # 空值 = "这次没改"，跳过（P-10）。历史 bug：设置页刚打开、loadSettings() 还没
+        # 返回时点保存，输入框是空的，提交 kugou_url= 就被判成"非法 scheme"报 400。
+        # 这里必须把「空」与「非法」分开：空跳过，非空但 scheme 不对才报 400。
+        if not _sanitize_env_value(form["kugou_url"]):
+            logger.info("[SETTINGS] kugou_url 为空，视为未修改，跳过")
+        else:
+            value = _sanitize_kugou_url(form["kugou_url"])
+            if not value:
+                return JSONResponse(
+                    {"status": "error", "message": "KuGouMusicApi 地址必须以 http:// 或 https:// 开头"},
+                    status_code=400,
+                )
+            env_content["FNMUSIC_KUGOU_URL"] = value
+            CONF["kugou_url"] = value
+            kugou_source.set_config({"kugou_url": value})
     if "kugou_quality" in form:
         value = _sanitize_env_value(form["kugou_quality"])
         if value:

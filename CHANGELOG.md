@@ -25,6 +25,35 @@
 
 ---
 
+## [1.0.7] — 2026-11-04
+
+### 修复
+
+- **桥接器 5 秒卡顿（主因）** — `app/proxy/app_socket_bridge.py`
+  响应转发过去无条件 `recv` 到 EOF；uvicorn 默认 `--timeout-keep-alive 5`，发完 body 不关连接，
+  于是每个经 `/app/fnmusic_kugou_pro/*` 的请求都白等 5 秒。
+  实测：直连 uvicorn body 0.024s / EOF 5.007s；走桥接器 body 0.008s / EOF 5.009s。
+  （`curl` 看不到这个现象 —— 它按 `Content-Length` 收完就退出。）
+  现改为解析响应头：收满 `Content-Length` 立即返回；`HEAD` / `204` / `304` 按 RFC 7230 §3.3.3
+  没有 body，发完头即收尾；chunked 与无长度声明的流式响应退回原 EOF 逻辑，行为不变；
+  顺带处理 `1xx` 中间响应（转出后继续读真正的响应头，`hops` 上限 8）。
+  **实测 5.0s → <0.1s。**
+- **P-10 空 `kugou_url` 误报 400** — `app/proxy/app.py`
+  设置页刚打开、`loadSettings()` 还没返回时点保存，提交的是空 `kugou_url`，
+  后端把它当「非法 scheme」回 400「必须以 http:// 或 https:// 开头」。
+  现在空值（含纯空白）视为「这次没改」直接跳过；非空但 scheme 不对仍回 400。
+  `GET ?save=1` 兼容路径同样受益。
+
+### 变更
+
+- **歌单排序** — 真实歌单在前、27 个虚拟歌单在后（原来虚拟在前，把用户自己的 5 个歌单挤到第二屏）。
+  数量、命名、guid 前缀一律不变。
+- **设置页请求合并 + favicon** — `loadSettings()` 与 `loadSaveOpts()` 原本各请求一次
+  `GET /_ext/settings`（同一份数据），现合并为一次并用 in-flight Promise 去重，
+  两块表单共用结果，`loadAll()` 改 `Promise.all`；favicon 改 data-URI 内联，
+  浏览器不再请求同源根 `/favicon.ico`（0 请求）。
+- **前端保险** — 设置读回来之前，三个保存按钮一律 `disabled`（后端放行之外的第二道）。
+
 ## [1.0.6] — 2026-11-04
 
 ### 修复

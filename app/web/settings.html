@@ -12,6 +12,7 @@ Copyright (C) 2026 星痕在此 (fnmusic_kugou_pro fork, 独立维护)
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>飞牛音乐酷狗增强</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23667eea'/%3E%3Cpath d='M13 23V11l9-2v12' stroke='white' stroke-width='2.2' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='23' r='2.6' fill='white'/%3E%3Ccircle cx='20' cy='21' r='2.6' fill='white'/%3E%3C/svg%3E">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f5f5;color:#333;padding:20px}
@@ -49,7 +50,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 </select>
 <label>启用状态</label>
 <select id="kugou_enabled"><option value="1">启用</option><option value="0">停用</option></select>
-<div class="btns"><button class="btn btn-green" onclick="saveSettings()">保存配置</button><button class="btn btn-primary" onclick="loadAll()">刷新</button></div>
+<div class="btns"><button class="btn btn-green" id="btn-save-main" disabled onclick="saveSettings()">保存配置</button><button class="btn btn-primary" onclick="loadAll()">刷新</button></div>
 <div class="hint">保存后请重启扩展应用，使 KuGou 源配置生效。</div>
 </div>
 <div class="card">
@@ -71,7 +72,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <label>去重索引目录（留空 = 跟随落盘目录，推荐）</label>
 <input type="text" id="save_marker_dir" placeholder="留空即可，会自动放到落盘目录下的 .fnmusic_save_index">
 <div class="hint" id="save-marker-hint">探测中...</div>
-<div class="btns"><button class="btn btn-green" onclick="saveSaveOpts()">保存边播边存设置</button></div>
+<div class="btns"><button class="btn btn-green" id="btn-save-archive" disabled onclick="saveSaveOpts()">保存边播边存设置</button></div>
 <div class="hint">开启后，<b>完整播放</b>一首在线歌曲（不拖动进度条、不中途切歌）才会归档到曲库，之后可离线播放。拖动/切歌只存了部分字节时不会误存半首歌。<br>
 文件名为「歌手 - 歌名」，已归档过的不会重复保存；写盘先写临时文件再原子替换，避免飞牛扫描到半截文件。<br>
 落盘目录必须位于飞牛共享曲库内（否则飞牛音乐扫不到）；含 <code>..</code> 或经符号链接逃出曲库的路径会被拒绝。<br>
@@ -90,7 +91,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <input type="text" id="save_max_bytes" placeholder="536870912">
 <label>单曲归档超时（秒）</label>
 <input type="text" id="save_timeout_s" placeholder="300">
-<div class="btns"><button class="btn btn-green" onclick="saveAdvancedOpts()">保存进阶设置</button></div>
+<div class="btns"><button class="btn btn-green" id="btn-save-advanced" disabled onclick="saveAdvancedOpts()">保存进阶设置</button></div>
 <div class="hint">进阶项一般不用改。改完需重启扩展应用生效。</div>
 </div>
 <div class="card">
@@ -110,9 +111,17 @@ function hideMsg(){document.getElementById('msg').className='msg';}
 async function jget(path){const r=await fetch(API+path);return await r.json();}
 async function post(path,body,retries){retries=retries==null?2:retries;let lastErr;for(let i=0;i<=retries;i++){try{const r=await fetch(API+path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body||''});const ct=(r.headers.get('content-type')||'').toLowerCase();if(ct.indexOf('json')>=0){return await r.json();}if(!r.ok){let detail='';try{const t=await r.text();detail=t?` (${t})`:'';}catch(e){}const err=new Error('HTTP '+r.status+detail);lastErr=err;if(i<retries){await new Promise(rs=>setTimeout(rs,700));continue;}throw err;}return await r.json();}catch(e){lastErr=e;if(i<retries){await new Promise(rs=>setTimeout(rs,700));continue;}throw e;}}}
 async function loadHealth(){try{const d=await jget('/_ext/healthz');const b=document.getElementById('health-badge');b.className='badge '+(d.ok?'on':'off');b.textContent=d.ok?'正常':'异常';document.getElementById('upstream').textContent=d.upstream||'unknown';document.getElementById('kugou').textContent=d.kugou||'unknown';}catch(e){}}
-async function loadSettings(){try{const d=await jget('/_ext/settings');document.getElementById('kugou_url').value=d.kugou_url||'http://127.0.0.1:8899';document.getElementById('kugou_quality').value=d.kugou_quality||'high';document.getElementById('kugou_enabled').value=d.kugou_enabled?'1':'0';}catch(e){}}
-async function loadSaveOpts(){try{
-const d=await jget('/_ext/settings');
+let _settingsP=null;
+// /_ext/settings 一次请求、两个渲染函数共用：历史实现 loadSettings 与 loadSaveOpts
+// 各请求一遍（返回的是**同一份**数据），白白多打一次上游探测 + 多占一个连接。
+// 用 in-flight Promise 去重：并发调用只会真的发一次。
+function fetchSettings(force){if(force||!_settingsP){_settingsP=jget('/_ext/settings').catch(e=>{_settingsP=null;return null;});}return _settingsP;}
+// 设置还没读回来之前保存按钮一律置灰（P-10 的第二道保险）：
+// 否则用户在输入框还是空的时候点保存，提交的是空 kugou_url。
+function setSaveEnabled(on){['btn-save-main','btn-save-archive','btn-save-advanced'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=!on;});}
+function renderSettings(d){document.getElementById('kugou_url').value=d.kugou_url||'http://127.0.0.1:8899';document.getElementById('kugou_quality').value=d.kugou_quality||'high';document.getElementById('kugou_enabled').value=d.kugou_enabled?'1':'0';}
+async function loadSettings(){const d=await fetchSettings();if(d)renderSettings(d);}
+function renderSaveOpts(d){
 const b=document.getElementById('save-badge');
 if(d.save_enabled){b.className='badge on';b.textContent='已开启';}else{b.className='badge off';b.textContent='未开启';}
 document.getElementById('save_enabled').value=d.save_enabled?'1':'0';
@@ -132,11 +141,13 @@ document.getElementById('fav-dir-eff').textContent=d.fav_dir_effective||'未知'
 document.getElementById('kugou_search_timeout').value=(d.kugou_search_timeout===undefined?'':d.kugou_search_timeout);
 document.getElementById('save_max_bytes').value=(d.save_max_bytes===undefined?'':d.save_max_bytes);
 document.getElementById('save_timeout_s').value=(d.save_timeout_s===undefined?'':d.save_timeout_s);
-}catch(e){document.getElementById('save-dir-hint').textContent='读取设置失败：'+e.message;}}
+}
+async function loadSaveOpts(){const d=await fetchSettings();if(d)renderSaveOpts(d);}
+async function refreshSettings(){const d=await fetchSettings(true);if(d){renderSettings(d);renderSaveOpts(d);setSaveEnabled(true);}else{setSaveEnabled(false);document.getElementById('save-dir-hint').textContent='读取设置失败，请点刷新重试';}}
 async function saveSaveOpts(){try{const qs=['save_enabled='+document.getElementById('save_enabled').value,'save_dir='+encodeURIComponent(document.getElementById('save_dir').value.trim()),'save_marker_dir='+encodeURIComponent(document.getElementById('save_marker_dir').value.trim()),'save_write_tags='+document.getElementById('save_write_tags').value,'save_write_cover='+document.getElementById('save_write_cover').value,'save_write_lyric='+document.getElementById('save_write_lyric').value,'local_first='+document.getElementById('local_first').value].join('&');const d=await post('/_ext/settings', qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
 async function saveAdvancedOpts(){try{const v=(id)=>document.getElementById(id).value.trim();const qs=['fav_dir='+encodeURIComponent(v('fav_dir')),'kugou_search_timeout='+encodeURIComponent(v('kugou_search_timeout')),'save_max_bytes='+encodeURIComponent(v('save_max_bytes')),'save_timeout_s='+encodeURIComponent(v('save_timeout_s'))].join('&');const d=await post('/_ext/settings', qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
 async function loadLogin(){try{const d=await jget('/_ext/login/status');const b=document.getElementById('login-badge');const hint=document.getElementById('login-invalid-hint');const uid=document.getElementById('login-userid');const ulv=document.getElementById('login-userid-val');const bl=document.getElementById('btn-login');const bo=document.getElementById('btn-logout');if(d.status==='logged_in'){b.className='badge on';b.textContent='已登录';uid.style.display='flex';ulv.textContent=d.userid||'';bl.style.display='none';bo.style.display='inline-block';hint.style.display='none';}else if(d.status==='token_invalid'){b.className='badge warn';b.textContent='登录已失效';uid.style.display='flex';ulv.textContent=d.userid||'';bl.style.display='inline-block';bo.style.display='inline-block';hint.style.display='block';}else{b.className='badge off';b.textContent='未登录';uid.style.display='none';bl.style.display='inline-block';bo.style.display='none';hint.style.display='none';}}catch(e){}}
-async function loadAll(){hideMsg();loadHealth();loadSettings();loadSaveOpts();loadLogin();}
+async function loadAll(){hideMsg();await Promise.all([loadHealth(),refreshSettings(),loadLogin()]);}
 async function saveSettings(){try{const qs=['kugou_url='+encodeURIComponent(document.getElementById('kugou_url').value.trim()),'kugou_quality='+encodeURIComponent(document.getElementById('kugou_quality').value),'kugou_enabled='+encodeURIComponent(document.getElementById('kugou_enabled').value)].join('&');const d=await post('/_ext/settings', qs);show(d.status==='ok'?'ok':'err',d.message||'已保存');setTimeout(loadAll,800);}catch(e){show('err','保存失败：'+e.message);}}
 async function showQRLogin(){document.getElementById('qr-login-container').style.display='block';document.getElementById('qr-image').innerHTML='';document.getElementById('qr-status').textContent='正在生成二维码...';try{const d=await jget('/_ext/login/qr/create');if(d.status==='ok'){document.getElementById('qr-image').innerHTML='<img src="'+d.qrCode+'" style="width:220px;height:220px;border-radius:8px" alt="登录二维码">';document.getElementById('qr-status').textContent='请使用酷狗音乐 APP 扫码';startPoll(d.key);qrExpireTimer=setTimeout(()=>{document.getElementById('qr-status').textContent='二维码可能已过期，请重新生成';},120000);}else{document.getElementById('qr-status').textContent='生成失败：'+(d.message||d.status);}}catch(e){document.getElementById('qr-status').textContent='请求失败：'+e.message;}}
 function startPoll(key){if(qrPollTimer)clearInterval(qrPollTimer);qrPollTimer=setInterval(async()=>{try{const d=await jget('/_ext/login/qr/check?key='+encodeURIComponent(key));if(d.status==='authenticated'){clearInterval(qrPollTimer);if(qrExpireTimer)clearTimeout(qrExpireTimer);document.getElementById('qr-status').textContent='登录成功！'+(d.nickname?' ('+d.nickname+')':'');document.getElementById('qr-status').style.color='#27ae60';setTimeout(loadAll,800);}else if(d.status==='scanned'){document.getElementById('qr-status').textContent='已扫码，请在酷狗音乐确认登录';}else if(d.status==='expired'){clearInterval(qrPollTimer);document.getElementById('qr-status').textContent='二维码已过期，请重新生成';}}catch(e){}},2000);}

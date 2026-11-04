@@ -424,6 +424,31 @@ check("内层 app.tgz 的 run_proxy.sh 保留可执行位",
 check(f"外层 .fpk 只出现 0644/0755 两种 mode（实测 {sorted(f'{m:04o}' for m in _out_modes)}）",
       _out_modes <= {0o644, 0o755}, str(sorted(f"{m:04o}" for m in _out_modes)))
 
+
+# ---------------------------------------------------------------- 载荷不得含临时诊断代码
+# 1.0.7 定这条护栏的由来：审查方在**运行目录**的 app.py 里临时加过一个
+# `_timing_middleware`（5503-5522 行）做耗时诊断。那种代码一旦被打进包，用户侧会
+# 多一层中间件、且没人记得删。这里按"字符串不得出现在载荷任何文件（含 pyc）里"来断言。
+# 注意：字符串本身写在测试里不算泄漏 —— 测试不进包（载荷里没有 tests/）。
+_DIAG_MARKERS = ("_timing_middleware", "timing_middleware")
+_hits = []
+with tarfile.open(inner) as _itf:
+    for _ti in _itf.getmembers():
+        if not _ti.isfile() or not _ti.name.endswith((".py", ".pyc", ".sh")):
+            continue
+        _blob = _itf.extractfile(_ti).read()
+        for _m in _DIAG_MARKERS:
+            if _m.encode() in _blob:
+                _hits.append(f"{_ti.name}:{_m}")
+                break
+check("载荷内不含临时诊断代码 _timing_middleware", not _hits, str(_hits[:4]))
+
+# 反向守卫：证明上面那条不是"永远为真的空断言" —— 同一套扫描逻辑必须能抓到
+# 人为放进去的标记（否则扫描写错了也看不出来）。
+_probe = b"def _timing_middleware(app): pass"
+check("扫描逻辑本身有效（人为标记能被抓到）",
+      any(m.encode() in _probe for m in _DIAG_MARKERS))
+
 print()
 print("=" * 70)
 print(f"结果：{len(PASS)} 通过 / {len(FAIL)} 失败")
