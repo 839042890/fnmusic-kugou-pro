@@ -238,6 +238,13 @@ CONF = {
     "lyric_field": _env_str("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": _env_float("FNMUSIC_SEARCH_TIMEOUT", 15.0),
     "search_cache_ttl": _env_float("FNMUSIC_SEARCH_CACHE_TTL", 300.0),
+    # 搜索防抖：连续输入时只发最后一次上游请求。0 表示旁路防抖（立即发，
+    # 但世代号仍保留，旧请求返回时会被判定 stale 而丢弃）。首次搜索（page<=1）
+    # 才等待；翻页 page>1 一律不等待，避免翻页卡顿。
+    "search_debounce_s": _env_float("FNMUSIC_SEARCH_DEBOUNCE_S", 0.8),
+    # 分级缓存 TTL：空结果 / 未取满 / 完整结果 各自独立存活秒数，避免一刀切。
+    "search_empty_ttl": _env_float("FNMUSIC_SEARCH_EMPTY_TTL", 10.0),
+    "search_partial_ttl": _env_float("FNMUSIC_SEARCH_PARTIAL_TTL", 30.0),
     # 歌手/专辑/歌单全量拉取（手机端不传 page/size 时触发）的分页参数
     # 酷狗 /search 有结果条数上限（歌曲/歌单 480，专辑/歌手 500）且末页必须
     # 满足 from + size <= 上限，否则返回 149 "Out Page Range"（HTTP 502，body
@@ -1255,9 +1262,9 @@ def _clean_meta_cache() -> None:
             _META_CACHE.pop(k, None)
 
 
-def _set_meta_cache(key: str, payload: dict) -> None:
+def _set_meta_cache(key: str, payload: dict, total: int = 0, complete: bool = False) -> None:
     _clean_meta_cache()
-    _META_CACHE[key] = {"ts": time.time(), "payload": payload}
+    _META_CACHE[key] = {"ts": _SEARCH_CLOCK(), "payload": payload, "total": total, "complete": complete}
 
 
 def _clean_search_cache() -> None:
@@ -1272,6 +1279,95 @@ def _clean_search_cache() -> None:
 def _set_search_cache(keyword: str, entry: dict) -> None:
     _clean_search_cache()
     _SEARCH_CACHE[keyword] = entry
+
+
+# ==== 搜索防抖 / 世代号 / 分级 TTL / 并发闸（1.0.8）====
+# _SEARCH_CLOCK 是注入点：生产恒为 time.time，测试 monkeypatch 成假时钟，
+# 从而确定性地推进防抖与 TTL。下面所有"现在"都读它，不直接读 time.time。
+_SEARCH_CLOCK = time.time
+
+# scope -> {"keyword": str, "event": asyncio.Event, "gen": int}
+_DEBOUNCE_STATE: dict[str, dict] = {}
+# 并发闸：(scope, keyword, page, size) -> Future。同源同参并发只发一次上游。
+_SEARCH_INFLIGHT: dict[tuple, "asyncio.Future"] = {}
+
+
+def _search_scope(request: Request) -> str:
+    """给请求算来源 scope：优先 X-Forwarded-For 首段，退化 client.host + UA。
+
+    经 nginx 反代时 request.client 大概率是 None，实际退化到按 User-Agent
+    区分。单用户 NAS 场景下按 UA 已足够，避免不同客户端互相打断防抖。
+    """
+    xff = (request.headers.get("x-forwarded-for") or "").strip()
+    client = xff.split(",")[0].strip() if xff else ""
+    if not client:
+        client = (
+            request.client.host
+            if request.client is not None and getattr(request.client, "host", None)
+            else ""
+        ) or "unix"
+    ua = (request.headers.get("user-agent") or "")[:64]
+    return f"{client}|{ua}"
+
+
+async def _wait_search_debounce(scope: str, keyword: str, first_page: bool) -> int:
+    """防抖：首次搜索等待 debounce 窗口；期间来了新关键词就让旧请求失效。
+
+    仅当关键词发生变化时才 bump 世代号并唤醒上一个等待者——相同关键词的
+    重复请求 / 翻页不应让在途的同关键词请求失效（否则并发去重会把自己的
+    结果判成 stale 而丢弃）。page>1（first_page=False）跳过等待。返回世代号。
+    """
+    state = _DEBOUNCE_STATE.setdefault(
+        scope, {"keyword": "", "event": asyncio.Event(), "gen": 0}
+    )
+    prev_kw = state.get("keyword") or ""
+    changed = prev_kw != keyword
+    if changed:
+        state["gen"] = int(state.get("gen") or 0) + 1
+        # 唤醒上一个等待者（它正 wait 在旧的 event 上），让它自检 stale。
+        state["event"].set()
+        state["keyword"] = keyword
+        state["event"] = asyncio.Event()
+    # 必须在等待前捕获本次 gen：等待期间若有更新输入会把 state["gen"] 继续
+    # 推高，等待后读到的将是「最新」而非「本次」的世代号，导致旧请求判 stale
+    # 恒为假（三个并发请求全都返回最新 gen，谁也不会被丢弃）。
+    gen = int(state.get("gen") or 0)
+    delay = float(CONF.get("search_debounce_s") or 0)
+    if first_page and changed and delay > 0:
+        try:
+            await asyncio.wait_for(state["event"].wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass  # 窗口内没有更新输入，正常继续
+    return gen
+
+
+def _search_stale(scope: str, gen: int) -> bool:
+    """该请求是否已被更新的关键词取代。"""
+    state = _DEBOUNCE_STATE.get(scope)
+    if not state:
+        return False
+    return int(state.get("gen") or 0) != gen
+
+
+def _search_ttl(entry: dict | None) -> float:
+    """分级缓存 TTL：空结果 10s、未取满 30s、完整结果 min(cfg, 300)。
+
+    entry 需含 total（合并后条数）与 complete（是否取满）。空/部分结果只
+    短暂缓存，避免把 0 结果或连续输入的中间态长期钉死。
+    """
+    if not isinstance(entry, dict):
+        return float(CONF.get("search_empty_ttl") or 10.0)
+    total = _read_int(entry.get("total"), 0)
+    if total <= 0:
+        return float(CONF.get("search_empty_ttl") or 10.0)
+    if not entry.get("complete"):
+        return float(CONF.get("search_partial_ttl") or 30.0)
+    return min(float(CONF.get("search_cache_ttl") or 300.0), 300.0)
+
+
+def _empty_search_envelope() -> dict:
+    """防抖判 stale 时给前端的空信封，形状对齐搜索结果（data.list/total）。"""
+    return {"code": 0, "data": {"list": [], "total": 0}}
 
 
 def _clean_stream_cache() -> None:
@@ -4711,13 +4807,20 @@ async def merged_search_meta(
     if size is not None and size < 1:
         size = None
 
+    # 1.0.8：防抖 + 世代号（同 /search/track）。首次搜索才等待，翻页不延迟。
+    scope = _search_scope(request)
+    gen = await _wait_search_debounce(scope, keyword, first_page=(page <= 1))
+    if _search_stale(scope, gen):
+        logger.warning("[SEARCH_META_DEBOUNCE_STALE] tag=%s keyword=%r gen=%d", tag, keyword, gen)
+        return JSONResponse(content=_empty_search_envelope())
+
     # 缓存命中：直接对深拷贝切片返回，不再发任何上游 / 酷狗请求。
     # 酷狗全量轮询要 10 次请求，每次翻页都重跑会让同一关键词的翻页代价
     # 线性放大（线上实测翻 3 页触发 90 次酷狗请求）。
     cache_key = f"meta:{tag}:{keyword}"
-    now = time.time()
+    now = _SEARCH_CLOCK()
     entry = _META_CACHE.get(cache_key)
-    if entry is not None and now - entry.get("ts", 0) < CONF["search_cache_ttl"]:
+    if entry is not None and now - entry.get("ts", 0) < _search_ttl(entry):
         # 先切片再打日志：切片前算 len 会把全量条数当返回条数，误导排查。
         envelope = _apply_meta_page(copy.deepcopy(entry["payload"]), page, size)
         logger.warning(
@@ -4729,36 +4832,77 @@ async def merged_search_meta(
 
     # 未命中：酷狗全量轮询 + 官方全量并发拉取，合并后缓存，再切片返回。
     # 酷狗 /search 不支持一次全量，按余数末页法轮询全部结果再合并。
-    kugou_task = asyncio.create_task(_fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag, cap=cap))
-    upstream_task = asyncio.create_task(_upstream_search_envelope(request, upstream_client))
+    async def _fetch_and_merge() -> Response:
+        kugou_task = asyncio.create_task(_fetch_kugou_all_pages(fetcher, request.app, keyword, tag=tag, cap=cap))
+        upstream_task = asyncio.create_task(_upstream_search_envelope(request, upstream_client))
+        try:
+            kugou_payload, upstream_json = await asyncio.gather(kugou_task, upstream_task)
+        except asyncio.CancelledError:
+            for t in (kugou_task, upstream_task):
+                if not t.done():
+                    t.cancel()
+            raise
+        except Exception:
+            for t in (kugou_task, upstream_task):
+                if not t.done():
+                    t.cancel()
+            raise
+
+        if not isinstance(upstream_json, dict):
+            if isinstance(kugou_payload, dict):
+                return JSONResponse(content=kugou_payload, status_code=200)
+            return await forward_to_upstream(request, upstream_client)
+
+        # 返回前再查一次 stale：旧请求不写缓存、不返回旧结果（覆盖新结果）。
+        if _search_stale(scope, gen):
+            logger.warning("[SEARCH_META_STALE_DROP] tag=%s keyword=%r gen=%d", tag, keyword, gen)
+            return JSONResponse(content=_empty_search_envelope())
+
+        envelope = merge_search_meta(upstream_json, kugou_payload, tag=tag)
+        # 分级缓存分类：total 用合并后真实条数；complete 用酷狗是否取全（取满上限
+        # 或自然翻完/空页提前停，见 _fetch_kugou_all_pages 的 complete 信号）。
+        kugou_complete = False
+        if isinstance(kugou_payload, dict):
+            kd = kugou_payload.get("data") or {}
+            if isinstance(kd, dict):
+                kugou_complete = bool(kd.get("complete"))
+        merged_total = _read_int(_search_data_root(envelope).get("total"), 0)
+        _set_meta_cache(cache_key, envelope, total=merged_total, complete=kugou_complete)
+        envelope = _apply_meta_page(copy.deepcopy(envelope), page, size)
+        logger.warning(
+            "[SEARCH_%s] cache miss keyword=%r total=%d page=%d size=%s returned=%d",
+            tag.upper(), keyword, _read_int(_search_data_root(envelope).get("total"), 0),
+            page, size, len(ensure_search_list(envelope)),
+        )
+        return JSONResponse(content=envelope)
+
+
+    # 并发闸：同 (scope, keyword, page, size) 只发一次上游，其余复用同一 Future。
+    gate_key = (scope, keyword, page, size)
+    _gate_fut = _SEARCH_INFLIGHT.get(gate_key)
+    if _gate_fut is not None:
+        try:
+            return await _gate_fut
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _SEARCH_INFLIGHT.pop(gate_key, None)
+    _gate_fut = asyncio.get_event_loop().create_future()
+    _SEARCH_INFLIGHT[gate_key] = _gate_fut
     try:
-        kugou_payload, upstream_json = await asyncio.gather(kugou_task, upstream_task)
+        response = await _fetch_and_merge()
     except asyncio.CancelledError:
-        for t in (kugou_task, upstream_task):
-            if not t.done():
-                t.cancel()
+        _SEARCH_INFLIGHT.pop(gate_key, None)
+        _gate_fut.cancel()
         raise
     except Exception:
-        for t in (kugou_task, upstream_task):
-            if not t.done():
-                t.cancel()
+        _SEARCH_INFLIGHT.pop(gate_key, None)
+        _gate_fut.cancel()
         raise
-
-    if not isinstance(upstream_json, dict):
-        if isinstance(kugou_payload, dict):
-            return JSONResponse(content=kugou_payload, status_code=200)
-        return await forward_to_upstream(request, upstream_client)
-
-    envelope = merge_search_meta(upstream_json, kugou_payload, tag=tag)
-    _set_meta_cache(cache_key, envelope)
-    envelope = _apply_meta_page(copy.deepcopy(envelope), page, size)
-    logger.warning(
-        "[SEARCH_%s] cache miss keyword=%r total=%d page=%d size=%s returned=%d",
-        tag.upper(), keyword, _read_int(_search_data_root(envelope).get("total"), 0),
-        page, size, len(ensure_search_list(envelope)),
-    )
-    return JSONResponse(content=envelope)
-
+    _SEARCH_INFLIGHT.pop(gate_key, None)
+    if not _gate_fut.done():
+        _gate_fut.set_result(response)
+    return response
 
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
     if path_guid:
@@ -5624,12 +5768,20 @@ async def search_track(request: Request):
                    keyword, page, size, CONF.get("kugou_enabled"),
                    len(CONF.get("kugou_token") or ""), CONF.get("kugou_userid") or "(none)")
 
-    now = time.time()
+    # 1.0.8：防抖 + 世代号。首次搜索（page<=1）等待 debounce 窗口；期间
+    # 来了新关键词就让旧请求 stale（不发上游、不覆盖新结果）。
+    scope = _search_scope(request)
+    gen = await _wait_search_debounce(scope, keyword, first_page=(page <= 1))
+    if _search_stale(scope, gen):
+        logger.warning("[SEARCH_DEBOUNCE_STALE] keyword=%r scope=%r gen=%d", keyword, scope, gen)
+        return JSONResponse(content=_empty_search_envelope())
+
+    now = _SEARCH_CLOCK()
     cached_entry = _SEARCH_CACHE.get(keyword)
-    is_valid_cache = cached_entry is not None and (now - cached_entry.get("ts", 0) < CONF["search_cache_ttl"])
+    is_valid_cache = cached_entry is not None and (now - cached_entry.get("ts", 0) < _search_ttl(cached_entry))
 
     if not (is_valid_cache and cached_entry is not None):
-        cached_entry: dict[str, Any] = {"ts": time.time(), "official_total": None, "online": {}}
+        cached_entry: dict[str, Any] = {"ts": _SEARCH_CLOCK(), "official_total": None, "online": {}}
         _set_search_cache(keyword, cached_entry)
     entry = cached_entry
     entry.setdefault("online", {})
@@ -5746,82 +5898,122 @@ async def search_track(request: Request):
             "pages": pages_fetched,
             "fetched_pages": pages_fetched,
             "fetched_items": len(items),
-            "complete": len(items) >= cap,
+            "complete": len(items) >= cap or pages_fetched >= expect_pages,
         }
         cache["__all__"] = result
         logger.warning("[SEARCH_KUGOU_ALL] keyword=%r items=%d cap=%d complete=%s",
                        keyword, len(result.get("items", [])), cap, result["complete"])
         return result
 
-    url_path = request.url.path
-    params = dict(request.query_params)
-    params.pop("size", None)
-    params.pop("page", None)
-    url_path = f"{url_path}?{urlencode(params)}" if params else url_path
-    headers = copy_incoming_headers(request)
-    req = upstream_client.build_request("GET", url_path, headers=headers)
-    upstream_task = asyncio.create_task(upstream_client.send(req))
-    kugou_prefetch_task = asyncio.create_task(_fetch_online_pages()) if CONF.get("kugou_enabled", True) else None
+    async def _fetch_and_merge() -> Response:
+        url_path = request.url.path
+        params = dict(request.query_params)
+        params.pop("size", None)
+        params.pop("page", None)
+        url_path = f"{url_path}?{urlencode(params)}" if params else url_path
+        headers = copy_incoming_headers(request)
+        req = upstream_client.build_request("GET", url_path, headers=headers)
+        upstream_task = asyncio.create_task(upstream_client.send(req))
+        kugou_prefetch_task = asyncio.create_task(_fetch_online_pages()) if CONF.get("kugou_enabled", True) else None
 
-    upstream_resp = await upstream_task
-    resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
+        upstream_resp = await upstream_task
+        resp_headers = filter_headers(upstream_resp.headers, exclude_keys={"content-length", "content-encoding"})
 
-    if upstream_resp.status_code != 200:
-        if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
-            kugou_prefetch_task.cancel()
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=upstream_resp.headers.get("content-type"),
-        )
+        if upstream_resp.status_code != 200:
+            if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
+                kugou_prefetch_task.cancel()
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=upstream_resp.headers.get("content-type"),
+            )
 
-    try:
-        upstream_json = upstream_resp.json()
-    except Exception:
-        if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
-            kugou_prefetch_task.cancel()
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=upstream_resp.headers.get("content-type"),
-        )
-
-    if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
-        if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
-            kugou_prefetch_task.cancel()
-        return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
-
-    online_all: dict | None = None
-    if kugou_prefetch_task is not None:
         try:
-            online_all = await asyncio.wait_for(kugou_prefetch_task, timeout=float(CONF.get("search_timeout", 15)))
-        except asyncio.TimeoutError:
-            logger.warning("[SEARCH_KUGOU_ALL_TIMEOUT] keyword=%r timeout=%s", keyword, CONF.get("search_timeout", 15))
-            kugou_prefetch_task.cancel()
+            upstream_json = upstream_resp.json()
+        except Exception:
+            if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
+                kugou_prefetch_task.cancel()
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=upstream_resp.headers.get("content-type"),
+            )
+
+        if not isinstance(upstream_json, dict) or upstream_json.get("code") != 0:
+            if kugou_prefetch_task is not None and not kugou_prefetch_task.done():
+                kugou_prefetch_task.cancel()
+            return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+        online_all: dict | None = None
+        if kugou_prefetch_task is not None:
+            try:
+                online_all = await asyncio.wait_for(kugou_prefetch_task, timeout=float(CONF.get("search_timeout", 15)))
+            except asyncio.TimeoutError:
+                logger.warning("[SEARCH_KUGOU_ALL_TIMEOUT] keyword=%r timeout=%s", keyword, CONF.get("search_timeout", 15))
+                kugou_prefetch_task.cancel()
+                online_all = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[SEARCH_KUGOU_ALL_ERROR] keyword=%r err=%s", keyword, exc)
+                online_all = None
+        else:
             online_all = None
+
+        # 飞牛官方 total 在首页更稳定；后续页官方结果可能已空，沿用已缓存的官方 total。
+        parent = _search_data_root(upstream_json)
+        current_official_total = _read_int(parent.get("total"), len(ensure_search_list(upstream_json)))
+        cached_official_total = entry.get("official_total")
+        if cached_official_total is None or current_official_total > _read_int(cached_official_total, 0):
+            entry["official_total"] = current_official_total
+        official_total = _read_int(entry.get("official_total"), current_official_total)
+
+        logger.warning("[SEARCH_KUGOU_PAGE] keyword=%r official_total=%d kugou_pages=%s fetched_pages=%s online_items=%d online_total=%s",
+                       keyword, official_total, ((online_all or {}).get("page")), ((online_all or {}).get("fetched_pages")), len((online_all or {}).get("items", [])), (online_all or {}).get("total"))
+
+        merged = merge_online_tracks(upstream_json, online_all, page=page, size=size)
+
+        # 返回前再查一次 stale：旧请求被新关键词取代后，不写缓存、不把旧结果
+        # 返回给前端（否则旧结果会覆盖新结果，前端闪烁/回退）。
+        if _search_stale(scope, gen):
+            logger.warning("[SEARCH_STALE_DROP] keyword=%r gen=%d", keyword, gen)
+            return JSONResponse(content=_empty_search_envelope())
+
+        # 分级缓存分类：total 用合并后真实条数；complete 用酷狗是否取满。
+        entry["total"] = _read_int(_search_data_root(merged).get("total"), 0)
+        entry["complete"] = bool(online_all and online_all.get("complete"))
+        logger.warning("[SEARCH_CACHE_WRITE] keyword=%r total=%d complete=%s ttl=%s",
+                       keyword, entry["total"], entry["complete"], _search_ttl(entry))
+        return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
+
+    # 并发闸：同 (scope, keyword, page, size) 只发一次上游，其余复用同一 Future。
+    gate_key = (scope, keyword, page, size)
+    _gate_fut = _SEARCH_INFLIGHT.get(gate_key)
+    if _gate_fut is not None:
+        try:
+            return await _gate_fut
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("[SEARCH_KUGOU_ALL_ERROR] keyword=%r err=%s", keyword, exc)
-            online_all = None
-    else:
-        online_all = None
-
-    # 飞牛官方 total 在首页更稳定；后续页官方结果可能已空，沿用已缓存的官方 total。
-    parent = _search_data_root(upstream_json)
-    current_official_total = _read_int(parent.get("total"), len(ensure_search_list(upstream_json)))
-    cached_official_total = entry.get("official_total")
-    if cached_official_total is None or current_official_total > _read_int(cached_official_total, 0):
-        entry["official_total"] = current_official_total
-    official_total = _read_int(entry.get("official_total"), current_official_total)
-
-    logger.warning("[SEARCH_KUGOU_PAGE] keyword=%r official_total=%d kugou_pages=%s fetched_pages=%s online_items=%d online_total=%s",
-                   keyword, official_total, ((online_all or {}).get("page")), ((online_all or {}).get("fetched_pages")), len((online_all or {}).get("items", [])), (online_all or {}).get("total"))
-
-    merged = merge_online_tracks(upstream_json, online_all, page=page, size=size)
-    return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
+        except Exception:
+            _SEARCH_INFLIGHT.pop(gate_key, None)
+    _gate_fut = asyncio.get_event_loop().create_future()
+    _SEARCH_INFLIGHT[gate_key] = _gate_fut
+    try:
+        response = await _fetch_and_merge()
+    except asyncio.CancelledError:
+        _SEARCH_INFLIGHT.pop(gate_key, None)
+        _gate_fut.cancel()
+        raise
+    except Exception:
+        _SEARCH_INFLIGHT.pop(gate_key, None)
+        _gate_fut.cancel()
+        raise
+    _SEARCH_INFLIGHT.pop(gate_key, None)
+    if not _gate_fut.done():
+        _gate_fut.set_result(response)
+    return response
 
 
 @app.get("/music/api/v1/search/artist")
@@ -5884,6 +6076,11 @@ async def _fetch_kugou_all_pages(
     pages_fetched = 0
     params = _kugou_page_params(cap, step)
     expect_pages = len(params)
+    # 是否「自然取全」：翻到最后一页，或某页已空（酷狗没有更多结果）。
+    # 结果不足 cap 时不能只靠 len>=cap 判 complete，否则小众歌手/专辑/歌单
+    # （结果 < 上限）会被误判成 partial，缓存 30s 就过期，与「完整结果
+    # 长 TTL」的意图相悖。
+    completed = False
 
     for p, step_size, _step_total in params:
         pages_fetched = p
@@ -5922,8 +6119,10 @@ async def _fetch_kugou_all_pages(
         if len(all_items) >= 5000:
             break
         if pages_fetched >= expect_pages:
+            completed = True
             break
         if not items:
+            completed = True
             break
 
     logger.warning(
@@ -5938,6 +6137,8 @@ async def _fetch_kugou_all_pages(
             "total": len(all_items),
             "pages": pages_fetched,
             "pagesize": step,
+            # 内部信号（merge_search_meta 读它判缓存分级，不影响酷狗结构消费方）。
+            "complete": len(all_items) >= cap or completed,
         },
     }
 
