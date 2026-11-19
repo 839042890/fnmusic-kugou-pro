@@ -114,7 +114,7 @@ def reset() -> None:
     OFFICIAL_CALLS.clear()
     app._SEARCH_CACHE.clear()
     app._META_CACHE.clear()
-    app._SEARCH_INFLIGHT.clear()
+    app._SEARCH_INFLIGHT = {}  # 恢复普通 dict：n04 等用例会整体替换成旁路闸，clear 会保留旁路行为
     app._DEBOUNCE_STATE.clear()
     app._SEARCH_CLOCK = _ORIG_CLOCK
     app._search_stale = _ORIG_STALE
@@ -130,6 +130,12 @@ def _set_search_conf(debounce: float) -> None:
 
 def _search(keyword: str, page: int = 1, size: int = 50) -> str:
     return f"/music/api/v1/search/track?q={keyword}&page={page}&size={size}"
+
+
+def _meta_search(kind: str, keyword: str, page: int = 1, size: int = 50) -> str:
+    """meta 搜索路径，默认带 size=50，与 track 侧 _search 保持 (page, size) 一致，
+    用于验证 gate_key 缺 tag 时四类搜索会互相撞 Future（1.0.9 回归）。"""
+    return f"/music/api/v1/search/{kind}?q={keyword}&page={page}&size={size}"
 
 
 # ---------------------------------------------------------------- 验收
@@ -389,6 +395,199 @@ def n04():
     assert len(OFFICIAL_CALLS) == 2, f"旁路闸后双并发应发 2 次官方，实际 {len(OFFICIAL_CALLS)}"
 
 
+# ---------------------------------------------------------------- 1.0.9 并发闸 tag 验收
+
+
+def _typed_envelope(prefix: str, n: int = 3) -> dict:
+    return {
+        "code": 0,
+        "data": {
+            "list": [{"guid": f"{prefix}:{i}", "name": f"{prefix}-{i}"} for i in range(n)],
+            "total": n,
+        },
+    }
+
+
+def _install_official_by_path(payloads: dict[str, dict]) -> None:
+    """按 path 分发官方响应，未列出的 path 返回空 envelope。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        OFFICIAL_CALLS.append(request.url.path)
+        payload = payloads.get(request.url.path, _official_envelope())
+        return httpx.Response(200, json=payload, headers={"content-type": "application/json"})
+    app.app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://unix")
+
+
+def _install_empty_meta_fetchers() -> None:
+    """三个 meta fetcher 恒返回空：让 meta 全量轮询第一页即停，不碰真实网络。"""
+    async def empty_meta(app_state, keyword, page=1, size=24):
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+    app.fetch_kugou_album_search = empty_meta
+    app.fetch_kugou_artist_search = empty_meta
+    app.fetch_kugou_playlist_search = empty_meta
+
+
+class _NoTagGate(dict):
+    """故障注入：并发闸 key 剥离 tag —— 模拟 1.0.8 gate_key 缺 tag 的行为。
+
+    key 形如 (tag, scope, keyword, page, size)，剥离 tag 后四类搜索在
+    (scope, keyword, page, size) 相同时共享同一个 Future，后到者复用先到者
+    的响应，串回错误类型的结果。
+    """
+    @staticmethod
+    def _strip(key):
+        return key[1:] if isinstance(key, tuple) and len(key) >= 2 else key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._strip(key))
+
+    def get(self, key, default=None):
+        return super().get(self._strip(key), default)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(self._strip(key), value)
+
+    def pop(self, key, *args):
+        return super().pop(self._strip(key), *args)
+
+
+def t01():
+    """1.0.9-c：gate_key 加 tag 后，meta 侧同 tag 并发去重仍然有效（album 双并发官方 1 次）。
+
+    与 a04c（track 侧硬编码 "track" 的去重）互补：本用例验证 meta 侧 gate_key 的
+    tag 变量加入后，同 tag 去重不失效。
+    """
+    _set_search_conf(0.0)
+    reset()
+
+    async def slow_album_handler(request: httpx.Request) -> httpx.Response:
+        OFFICIAL_CALLS.append(request.url.path)
+        await asyncio.sleep(0.1)  # 让第一个请求卡住，第二个命中并发闸
+        return httpx.Response(200, json=_typed_envelope("album-official"), headers={"content-type": "application/json"})
+    app.app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_album_handler), base_url="http://unix")
+
+    async def slow_album_fetch(app_state, keyword, page=1, size=24):
+        await asyncio.sleep(0.1)
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+    app.fetch_kugou_album_search = slow_album_fetch
+
+    async def go():
+        async with _client() as c:
+            r1, r2 = await asyncio.gather(
+                c.get(_meta_search("album", "周杰伦")), c.get(_meta_search("album", "周杰伦")),
+            )
+            return r1, r2
+    r1, r2 = asyncio.run(go())
+    print(f"  [1.0.9-c] album 同 tag 双并发 → 官方请求数={len(OFFICIAL_CALLS)}，两响应一致={r1.content == r2.content}")
+    assert len(OFFICIAL_CALLS) == 1, \
+        f"gate_key 加 tag 后同 tag 双并发仍应去重（官方 1 次），实际 {len(OFFICIAL_CALLS)}"
+    assert r1.json() == r2.json(), "复用同一 Future 应返回相同结果"
+
+
+def t02():
+    """1.0.9-d(前半)：故障注入——gate_key 去 tag → track 撞上 album Future → 返回 album 数据（复现 bug）。"""
+    _set_search_conf(0.0)
+    reset()
+    _install_official_by_path({
+        "/music/api/v1/search/track": _typed_envelope("track-official"),
+        "/music/api/v1/search/album": _typed_envelope("album-official"),
+    })
+    _install_kugou(lambda kw, page: {"items": [], "total": 0})
+
+    async def slow_album(app_state, keyword, page=1, size=24):
+        await asyncio.sleep(0.15)  # 让 album 卡在 in-flight，等 track 撞闸
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+    app.fetch_kugou_album_search = slow_album
+    app._SEARCH_INFLIGHT = _NoTagGate()  # 故障注入：去 tag
+
+    async def go():
+        async with _client() as c:
+            ta = asyncio.create_task(c.get(_meta_search("album", "周杰伦")))
+            await asyncio.sleep(0.02)
+            rb = await c.get(_search("周杰伦"))
+            ra = await ta
+            return ra, rb
+    ra, rb = asyncio.run(go())
+    album_guids = [x.get("guid") for x in ra.json()["data"]["list"]]
+    track_guids = [x.get("guid") for x in rb.json()["data"]["list"]]
+    print(f"  [1.0.9-d 故障注入] album={album_guids}")
+    print(f"  [1.0.9-d 故障注入] track={track_guids}  ← 应全是 album-official（bug 复现，前端按单曲播放将 404）")
+    assert track_guids and all(str(g).startswith("album-official") for g in track_guids), \
+        f"gate_key 去 tag 后 track 应拿到 album 数据（bug 复现），实际 {track_guids}"
+
+
+def t03():
+    """1.0.9-d(后半)：tag 加回（正常闸）→ track 与 album 各拿各的，不再串。"""
+    _set_search_conf(0.0)
+    reset()
+    app._SEARCH_INFLIGHT = {}  # 恢复带 tag 的正常闸（代码里 gate_key 已含 tag）
+    _install_official_by_path({
+        "/music/api/v1/search/track": _typed_envelope("track-official"),
+        "/music/api/v1/search/album": _typed_envelope("album-official"),
+    })
+    _install_kugou(lambda kw, page: {"items": [], "total": 0})
+
+    async def slow_album(app_state, keyword, page=1, size=24):
+        await asyncio.sleep(0.15)
+        return {"code": 0, "msg": "", "data": {"list": [], "total": 0}}
+    app.fetch_kugou_album_search = slow_album
+
+    async def go():
+        async with _client() as c:
+            ta = asyncio.create_task(c.get(_meta_search("album", "周杰伦")))
+            await asyncio.sleep(0.02)
+            rb = await c.get(_search("周杰伦"))
+            ra = await ta
+            return ra, rb
+    ra, rb = asyncio.run(go())
+    album_guids = [x.get("guid") for x in ra.json()["data"]["list"]]
+    track_guids = [x.get("guid") for x in rb.json()["data"]["list"]]
+    print(f"  [1.0.9-d 修复后] album={album_guids}")
+    print(f"  [1.0.9-d 修复后] track={track_guids}  ← 应全是 track-official（不复现）")
+    assert track_guids and all(str(g).startswith("track-official") for g in track_guids), \
+        f"gate_key 带 tag 后 track 应拿到 track 数据，实际 {track_guids}"
+    assert album_guids and all(str(g).startswith("album-official") for g in album_guids), \
+        f"album 应拿到 album 数据，实际 {album_guids}"
+
+
+def t04():
+    """1.0.9-a/b/e 后端模拟：debounce=0（FNMUSIC_SEARCH_DEBOUNCE_S=0），
+    自动搜索四 tab 并发 + 点搜索 track，重复 10 次 → 点搜索恒为 track 类型。"""
+    _set_search_conf(0.0)
+    reset()
+    app._SEARCH_INFLIGHT = {}
+    _install_official_by_path({
+        "/music/api/v1/search/track": _typed_envelope("track-official"),
+        "/music/api/v1/search/album": _typed_envelope("album-official"),
+        "/music/api/v1/search/artist": _typed_envelope("artist-official"),
+        "/music/api/v1/search/playlist": _typed_envelope("playlist-official"),
+    })
+    _install_kugou(lambda kw, page: {"items": [], "total": 0})
+    _install_empty_meta_fetchers()
+
+    async def go():
+        bad = []
+        async with _client() as c:
+            for i in range(10):
+                # 自动搜索：四个 tab 并发
+                await asyncio.gather(
+                    c.get(_search("周杰伦")),
+                    c.get(_meta_search("album", "周杰伦")),
+                    c.get(_meta_search("artist", "周杰伦")),
+                    c.get(_meta_search("playlist", "周杰伦")),
+                )
+                # 点搜索：只重发当前 tab（track）
+                r = await c.get(_search("周杰伦"))
+                guids = [x.get("guid") for x in r.json()["data"]["list"]]
+                if not guids or not all(str(g).startswith("track-official") for g in guids):
+                    bad.append((i + 1, guids))
+            return bad
+    bad = asyncio.run(go())
+    print(f"  [1.0.9-a/b/e] debounce=0 下 10 次「自动搜索+点搜索」异常次数={len(bad)} {bad}")
+    assert not bad, f"点搜索应恒为 track 类型，异常: {bad}"
+
+
 # ---------------------------------------------------------------- 运行
 print("\n[1] 验收（应全绿）")
 case("a01 防抖合并三字 → 1/1", a01)
@@ -404,6 +603,12 @@ n01()
 n02()
 n03()
 n04()
+
+print("\n[2b] 1.0.9 并发闸 tag 验收（含故障注入与阴性对照）")
+case("t01 同 tag 并发去重仍有效（官方 1 次）", t01)
+case("t02 故障注入去 tag → track 拿到 album（复现）", t02)
+case("t03 修复后 tag 隔离 → 各拿各的", t03)
+case("t04 debounce=0 十连自动+点搜索恒 track", t04)
 
 print("\n[3] 汇总")
 print(f"  通过 {len(PASS)} / 失败 {len(FAIL)}")

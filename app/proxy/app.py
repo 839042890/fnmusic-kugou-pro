@@ -4877,8 +4877,10 @@ async def merged_search_meta(
         return JSONResponse(content=envelope)
 
 
-    # 并发闸：同 (scope, keyword, page, size) 只发一次上游，其余复用同一 Future。
-    gate_key = (scope, keyword, page, size)
+    # 并发闸：同 (tag, scope, keyword, page, size) 只发一次上游，其余复用同一 Future。
+    # tag 必须参与 key：track/album/artist/playlist 共用同一个 _SEARCH_INFLIGHT，
+    # 缺 tag 会让不同搜索类型并发时互相复用 Future，串回错误类型的结果（1.0.9）。
+    gate_key = (tag, scope, keyword, page, size)
     _gate_fut = _SEARCH_INFLIGHT.get(gate_key)
     if _gate_fut is not None:
         try:
@@ -5988,8 +5990,10 @@ async def search_track(request: Request):
                        keyword, entry["total"], entry["complete"], _search_ttl(entry))
         return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
 
-    # 并发闸：同 (scope, keyword, page, size) 只发一次上游，其余复用同一 Future。
-    gate_key = (scope, keyword, page, size)
+    # 并发闸：同 (tag, scope, keyword, page, size) 只发一次上游，其余复用同一 Future。
+    # tag 必须参与 key：track/album/artist/playlist 共用同一个 _SEARCH_INFLIGHT，
+    # 缺 tag 会让不同搜索类型并发时互相复用 Future，串回错误类型的结果（1.0.9）。
+    gate_key = ("track", scope, keyword, page, size)
     _gate_fut = _SEARCH_INFLIGHT.get(gate_key)
     if _gate_fut is not None:
         try:
