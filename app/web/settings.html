@@ -29,19 +29,32 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.btn{padding:8px 20px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;color:white;display:inline-block;text-decoration:none}.btn:hover{transform:translateY(-1px);box-shadow:0 2px 6px rgba(0,0,0,.15)}.btn-primary{background:#667eea}.btn-warn{background:#f39c12}.btn-danger{background:#e74c3c}.btn-green{background:#27ae60}.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
 .hint{color:#888;font-size:12px;margin-top:8px;line-height:1.5}.msg{padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;display:none}.msg.ok{background:#d4f5d4;color:#2d7a2d;display:block}.msg.err{background:#f5d4d4;color:#a03030;display:block}.qrbox{text-align:center;padding:16px 0}
 .pm-modes{display:flex;gap:14px;flex-wrap:wrap;margin:4px 0 10px}.pm-modes label{display:flex;align-items:center;gap:5px;margin:0;color:#444}.pm-modes input{width:auto;margin:0}.pm-list{max-height:260px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:6px 10px;margin-bottom:10px}.pm-item{display:flex;align-items:center;gap:8px;padding:6px 2px;border-bottom:1px solid #f5f5f5;font-size:13px}.pm-item:last-child{border:none}.pm-item .nm{flex:1;min-width:0;word-break:break-all}.pm-item .cnt{color:#999;font-size:12px;white-space:nowrap}.pm-item.disabled{color:#bbb}.pm-item input[type=checkbox]{width:auto;margin:0}.pm-empty{color:#999;font-size:12px;padding:8px 0}
+.tabs{display:flex;flex-wrap:nowrap;gap:2px;align-items:stretch;overflow-x:auto;overflow-y:hidden;white-space:nowrap;background:#fff;border-bottom:1px solid #ececf3;padding:0 10px;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab-btn{flex:0 0 auto;appearance:none;border:0;border-bottom:3px solid transparent;background:transparent;color:#666;padding:12px 14px 9px;font:inherit;font-size:14px;font-weight:600;white-space:nowrap;cursor:pointer}
+.tab-btn:hover{color:#4c5fd7;background:#f7f8ff}
+.tab-btn.active{color:#667eea;border-bottom-color:#667eea}
+.tab-btn:focus-visible{outline:2px solid #667eea;outline-offset:-2px}
+.card[hidden]{display:none!important}
+@media (prefers-color-scheme:dark){.tabs{background:#202127;border-bottom-color:#343640}.tab-btn{color:#c7cad4}.tab-btn:hover{color:#fff;background:#2a2c34}.tab-btn.active{color:#aeb8ff;border-bottom-color:#8f9cff}}
 </style>
 </head>
 <body>
 <div class="c">
 <div class="hdr"><h1>飞牛音乐酷狗增强</h1><div class="sub">KuGouMusicApi 音源与扫码登录</div></div>
+<nav class="tabs" aria-label="设置分页">
+<button type="button" class="tab-btn active" id="tab-1" data-settings-tab="tab-1" aria-pressed="true">连接与音源</button>
+<button type="button" class="tab-btn" id="tab-2" data-settings-tab="tab-2" aria-pressed="false">存储与配置</button>
+<button type="button" class="tab-btn" id="tab-3" data-settings-tab="tab-3" aria-pressed="false">歌单与扩展</button>
+</nav>
 <div id="msg" class="msg"></div>
-<div class="card">
+<div class="card" data-tab-card="tab-1">
 <h2>服务状态</h2>
 <div class="row"><span class="k">扩展服务</span><span class="v"><span class="badge warn" id="health-badge">检测中</span></span></div>
 <div class="row"><span class="k">上游音乐</span><span class="v" id="upstream">检测中</span></div>
 <div class="row"><span class="k">KuGou 源</span><span class="v" id="kugou">检测中</span></div>
 </div>
-<div class="card">
+<div class="card" data-tab-card="tab-1">
 <h2>KuGou 音源配置</h2>
 <label>API 地址</label>
 <input type="text" id="kugou_url" placeholder="http://127.0.0.1:8899">
@@ -54,7 +67,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <div class="btns"><button class="btn btn-green" id="btn-save-main" disabled onclick="saveSettings()">保存配置</button><button class="btn btn-primary" onclick="loadAll()">刷新</button></div>
 <div class="hint">保存后请重启扩展应用，使 KuGou 源配置生效。</div>
 </div>
-<div class="card">
+<div class="card" data-tab-card="tab-2" hidden>
 <h2>边播边存</h2>
 <div class="row"><span class="k">功能状态</span><span class="v"><span class="badge off" id="save-badge">未开启</span></span></div>
 <label>启用边播边存</label>
@@ -79,7 +92,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 落盘目录必须位于飞牛共享曲库内（否则飞牛音乐扫不到）；含 <code>..</code> 或经符号链接逃出曲库的路径会被拒绝。<br>
 <b>去重索引目录</b>用来记「哪首歌已经存过」。留空时会自动放到落盘目录下的隐藏目录，跟着曲库走——这样覆盖安装/升级扩展不会丢索引，也就不会把听过的歌再存一遍成「歌名 (2)」。</div>
 </div>
-<div class="card">
+<div class="card" data-tab-card="tab-3" hidden>
 <h2>歌单显示范围</h2>
 <div class="hint">按飞牛用户控制「我的歌单」里能看到哪些酷狗歌单。规则保存后按文件修改时间热加载，无需重启。</div>
 <div id="pm-msg" class="msg" style="margin-top:10px"></div>
@@ -98,7 +111,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <div class="btns"><button class="btn btn-green" id="btn-save-playlist-map" disabled data-pm-save="1" onclick="savePlaylistMap()">保存显示范围</button><button class="btn btn-primary" onclick="loadPlaylistMap(true)">刷新</button></div>
 <div class="hint">「每日推荐 / 排行榜 / 精选歌单」是虚拟歌单，不参与过滤，已置灰。</div>
 </div>
-<div class="card">
+<div class="card" data-tab-card="tab-2" hidden>
 <h2>登录与配置文件</h2>
 <div class="row"><span class="k">配置文件</span><span class="v" id="env-file" style="word-break:break-all;font-size:12px">探测中...</span></div>
 <div class="hint">登录凭证与所有设置都存这里。<b>它不在应用安装目录内</b>，所以覆盖安装 / 升级扩展都不会把登录态冲掉——早先版本把配置放在安装目录里，升一次级就要重扫一次码，已修。</div>
@@ -114,7 +127,7 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <div class="btns"><button class="btn btn-green" id="btn-save-advanced" disabled onclick="saveAdvancedOpts()">保存进阶设置</button></div>
 <div class="hint">进阶项一般不用改。改完需重启扩展应用生效。</div>
 </div>
-<div class="card">
+<div class="card" data-tab-card="tab-1">
 <h2>KuGou 登录</h2>
 <div class="row"><span class="k">登录状态</span><span class="v"><span class="badge off" id="login-badge">未登录</span></span></div>
 <div class="row" id="login-userid" style="display:none"><span class="k">用户ID</span><span class="v" id="login-userid-val"></span></div>
@@ -126,6 +139,11 @@ input[type=text],select{width:100%;padding:8px 10px;border:1px solid #ddd;border
 <script>
 const API=location.pathname.replace(/\/$/,'');
 let qrPollTimer=null, qrExpireTimer=null;
+let SETTINGS_TAB_KEY='fnmusic_settings_tab';
+function settingsTabFromHash(){var m=/^#(tab-[123])$/.exec(location.hash);return m?m[1]:'';}
+function settingsStoredTab(){try{var t=localStorage.getItem(SETTINGS_TAB_KEY);return /^tab-[123]$/.test(t||'')?t:'';}catch(e){return '';}}
+function setSettingsTab(tab,updateHash){if(!/^tab-[123]$/.test(tab))tab='tab-1';document.querySelectorAll('[data-tab-card]').forEach(function(card){card.hidden=card.getAttribute('data-tab-card')!==tab;});document.querySelectorAll('[data-settings-tab]').forEach(function(btn){var on=btn.getAttribute('data-settings-tab')===tab;btn.classList.toggle('active',on);btn.setAttribute('aria-pressed',on?'true':'false');btn.tabIndex=on?0:-1;});try{localStorage.setItem(SETTINGS_TAB_KEY,tab);}catch(e){}if(updateHash){try{history.replaceState(null,'','#'+tab);}catch(e){location.hash=tab;}}}
+function initSettingsTabs(){document.querySelectorAll('[data-settings-tab]').forEach(function(btn){btn.addEventListener('click',function(){setSettingsTab(btn.getAttribute('data-settings-tab'),true);});});var tab=settingsTabFromHash()||settingsStoredTab()||'tab-1';setSettingsTab(tab,false);window.addEventListener('hashchange',function(){var h=settingsTabFromHash();if(h)setSettingsTab(h,false);});}
 function show(t,m){var e=document.getElementById('msg');e.className='msg '+t;e.textContent=m;}
 function hideMsg(){document.getElementById('msg').className='msg';}
 async function jget(path){const r=await fetch(API+path);return await r.json();}
@@ -184,6 +202,7 @@ async function saveSettings(){try{const qs=['kugou_url='+encodeURIComponent(docu
 async function showQRLogin(){document.getElementById('qr-login-container').style.display='block';document.getElementById('qr-image').innerHTML='';document.getElementById('qr-status').textContent='正在生成二维码...';try{const d=await jget('/_ext/login/qr/create');if(d.status==='ok'){document.getElementById('qr-image').innerHTML='<img src="'+d.qrCode+'" style="width:220px;height:220px;border-radius:8px" alt="登录二维码">';document.getElementById('qr-status').textContent='请使用酷狗音乐 APP 扫码';startPoll(d.key);qrExpireTimer=setTimeout(()=>{document.getElementById('qr-status').textContent='二维码可能已过期，请重新生成';},120000);}else{document.getElementById('qr-status').textContent='生成失败：'+(d.message||d.status);}}catch(e){document.getElementById('qr-status').textContent='请求失败：'+e.message;}}
 function startPoll(key){if(qrPollTimer)clearInterval(qrPollTimer);qrPollTimer=setInterval(async()=>{try{const d=await jget('/_ext/login/qr/check?key='+encodeURIComponent(key));if(d.status==='authenticated'){clearInterval(qrPollTimer);if(qrExpireTimer)clearTimeout(qrExpireTimer);document.getElementById('qr-status').textContent='登录成功！'+(d.nickname?' ('+d.nickname+')':'');document.getElementById('qr-status').style.color='#27ae60';setTimeout(loadAll,800);}else if(d.status==='scanned'){document.getElementById('qr-status').textContent='已扫码，请在酷狗音乐确认登录';}else if(d.status==='expired'){clearInterval(qrPollTimer);document.getElementById('qr-status').textContent='二维码已过期，请重新生成';}}catch(e){}},2000);}
 async function doLogout(){if(!confirm('确定退出 KuGou 登录？'))return;try{const d=await post('/_ext/login/logout');show(d.status==='ok'?'ok':'err',d.message||'已退出');loadLogin();}catch(e){show('err','退出失败：'+e.message);}}
+initSettingsTabs();
 loadAll();
 </script>
 </body>
