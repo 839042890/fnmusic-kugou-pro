@@ -25,6 +25,14 @@
 
 ---
 
+## [1.1.1] — 2026-11-22
+
+### 修复
+
+- **勾选框点不动** — `pmUpdateModeUI` 用 `input[type=checkbox]:not(:disabled)` 选元素，
+  而「全部显示」模式已把真实歌单置为 `disabled`，切到白/黑名单时这些元素选不中，
+  无法重新启用。改为 `.pm-item:not(.disabled) input[type=checkbox]`，只按行类区分虚拟歌单。
+
 ## [1.1.0] — 2026-11-22
 
 ### 新增（歌单黑白名单 UI）
