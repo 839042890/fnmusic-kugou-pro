@@ -32,7 +32,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any, AsyncGenerator, Awaitable, Callable, Coroutine
-from urllib.parse import quote, urlencode, parse_qs, unquote
+from urllib.parse import quote, urlencode, parse_qs, unquote, urlparse
 from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
@@ -5736,6 +5736,146 @@ async def ext_playlist_map_gateway(request: Request):
     return await ext_playlist_map(request)
 
 
+@app.get("/_ext/playlist_map/catalog")
+async def ext_playlist_map_catalog(request: Request):
+    """设置页用：列出飞牛用户、可选酷狗歌单与当前规则。
+
+    users 只返回 guid 前 8 位；写入接口要求完整 guid 或唯一用户名，
+    绝不把 guid_short 当作可回写的用户键。
+    """
+    if not CONF.get("kugou_enabled", True):
+        return JSONResponse(
+            {"status": "error", "code": "kugou_disabled",
+             "message": "酷狗源已停用，请先在设置页启用 KuGou 音源"},
+            status_code=409,
+        )
+    if not CONF.get("kugou_token"):
+        return JSONResponse(
+            {"status": "error", "code": "kugou_not_logged_in",
+             "message": "酷狗未登录，请先在设置页扫码登录"},
+            status_code=401,
+        )
+    try:
+        probe = await kugou_source.probe_login_state()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[PLAYLIST_MAP] catalog 登录探活失败：%s", e)
+        return JSONResponse(
+            {"status": "error", "code": "kugou_login_unknown",
+             "message": "无法确认酷狗登录状态，请稍后重试"},
+            status_code=503,
+        )
+    state = str((probe or {}).get("state") or "unknown")
+    if state == "invalid":
+        return JSONResponse(
+            {"status": "error", "code": "kugou_login_invalid",
+             "message": "酷狗登录已失效，请重新扫码登录"},
+            status_code=401,
+        )
+    if state != "valid":
+        return JSONResponse(
+            {"status": "error", "code": "kugou_login_unknown",
+             "message": "无法确认酷狗登录状态，请检查 KuGouMusicApi 后重试"},
+            status_code=503,
+        )
+
+    now = time.time()
+    cache_key = hashlib.sha256(
+        f"{CONF.get('kugou_token') or ''}\x1f{CONF.get('kugou_userid') or ''}".encode("utf-8")
+    ).hexdigest()[:16]
+    cached = _PM_CATALOG_CACHE.get("data")
+    if (cached is not None and _PM_CATALOG_CACHE.get("key") == cache_key
+            and now - float(_PM_CATALOG_CACHE.get("ts") or 0) < _PM_CATALOG_TTL):
+        return JSONResponse({**cached, "cached": True})
+
+    bundles = await fetch_kugou_user_playlist_bundles()
+    cfg = load_playlist_map()
+
+    users = []
+    for row in _user_table_rows():
+        guid = str(row.get("guid") or "").strip()
+        if not guid:
+            continue
+        name = str(row.get("name") or "").strip()
+        rule, _hit = playlist_rule_for(guid, name)
+        users.append({
+            "guid_short": guid[:8],
+            "name": name,
+            "rule": _pm_brief_rule(rule),
+        })
+
+    playlists = []
+    for bundle in bundles:
+        raw_guid = str(bundle.get("guid") or "")
+        is_feed = is_kugou_feed_guid(raw_guid)
+        pid = str(bundle.get("id") or "") if is_feed else kugou_playlist_id_from_guid(raw_guid)
+        if not pid:
+            logger.warning("[PLAYLIST_MAP] catalog 跳过无法解析 id 的歌单")
+            continue
+        try:
+            track_count = int(bundle.get("trackCount") or bundle.get("count") or 0)
+        except (TypeError, ValueError):
+            track_count = 0
+        playlists.append({
+            "id": pid,
+            "name": str(bundle.get("name") or ""),
+            "track_count": max(0, track_count),
+            "is_feed": bool(is_feed),
+        })
+
+    payload = {
+        "status": "ok",
+        "users": users,
+        "playlists": playlists,
+        "default": _pm_brief_rule(cfg.get("default") or {"mode": "all", "ids": frozenset()}),
+    }
+    _PM_CATALOG_CACHE.update({"ts": now, "data": payload, "key": cache_key})
+    return JSONResponse({**payload, "cached": False})
+
+
+@app.get("/_ext/playlist_map/stats")
+async def ext_playlist_map_stats():
+    """只读统计：filter_playlist_bundles 入口调用次数。"""
+    return JSONResponse({
+        "filter_playlist_bundles_calls": int(_PM_FILTER_CALLS),
+        "calls": int(_PM_FILTER_CALLS),
+    })
+
+
+@app.post("/_ext/playlist_map")
+async def ext_playlist_map_save(request: Request):
+    """保存单个用户规则或 default 规则；无鉴权，与 POST /_ext/settings 同级别。"""
+    if not _pm_same_origin(request):
+        return JSONResponse(
+            {"status": "error", "code": "cross_site_rejected",
+             "message": "拒绝跨站来源的写入请求"},
+            status_code=403,
+        )
+    try:
+        payload = await _pm_parse_save_payload(request)
+        _pm_apply_save_payload(payload)
+    except _PMWriteError as e:
+        return JSONResponse(
+            {"status": "error", "code": e.code, "message": e.message},
+            status_code=e.status_code,
+        )
+    return JSONResponse({"status": "ok", "message": "已生效（无需重启）"})
+
+
+@app.get("/app/fnmusic_kugou_pro/_ext/playlist_map/catalog")
+async def ext_playlist_map_catalog_gateway(request: Request):
+    return await ext_playlist_map_catalog(request)
+
+
+@app.get("/app/fnmusic_kugou_pro/_ext/playlist_map/stats")
+async def ext_playlist_map_stats_gateway():
+    return await ext_playlist_map_stats()
+
+
+@app.post("/app/fnmusic_kugou_pro/_ext/playlist_map")
+async def ext_playlist_map_save_gateway(request: Request):
+    return await ext_playlist_map_save(request)
+
+
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):
@@ -8104,6 +8244,251 @@ def _pm_empty() -> dict:
 # mtime 热加载缓存：checked 是"上次 stat 的时刻"，1 秒内不重复 stat（省 syscall）
 _PM_CACHE: dict = {"mtime": None, "data": None, "checked": 0.0}
 _PM_STAT_TTL = 1.0
+# catalog 缓存与验收计数器。计数器只在 filter_playlist_bundles 入口自增，
+# stats 接口只读，不参与任何过滤判定。
+_PM_CATALOG_CACHE: dict = {"ts": 0.0, "data": None}
+_PM_CATALOG_TTL = 60.0
+_PM_FILTER_CALLS = 0
+
+
+class _PMWriteError(Exception):
+    def __init__(self, message: str, status_code: int = 400, code: str = "invalid_payload"):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.code = code
+
+
+def _pm_brief_rule(rule: dict) -> dict:
+    return {"mode": rule.get("mode") or "all", "ids": sorted(rule.get("ids") or [])}
+
+
+def _pm_same_origin(request: Request) -> bool:
+    """没有 Origin/Referer 的命令行请求放行；带了就必须与 Host 同源。"""
+    host = str(request.headers.get("host") or "").strip().lower()
+    if not host:
+        return True
+    for header in ("origin", "referer"):
+        raw = str(request.headers.get(header) or "").strip()
+        if not raw:
+            continue
+        if raw.lower() == "null":
+            return False
+        try:
+            netloc = urlparse(raw).netloc.lower()
+        except Exception:  # noqa: BLE001
+            return False
+        if not netloc or netloc != host:
+            return False
+    return True
+
+
+async def _pm_parse_save_payload(request: Request) -> dict:
+    ctype = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    raw = await request.body()
+    if ctype == "application/json":
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as e:  # noqa: BLE001
+            raise _PMWriteError(f"JSON 解析失败：{e}", 400, "bad_json") from e
+        if not isinstance(payload, dict):
+            raise _PMWriteError("请求体必须是 JSON 对象", 400, "bad_json")
+        return payload
+    if ctype not in ("", "application/x-www-form-urlencoded"):
+        raise _PMWriteError("只接受 JSON 或表单请求", 415, "unsupported_content_type")
+
+    try:
+        q = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+    except Exception as e:  # noqa: BLE001
+        raise _PMWriteError(f"表单解析失败：{e}", 400, "bad_form") from e
+
+    def one(*keys: str) -> str | None:
+        for key in keys:
+            vals = q.get(key)
+            if vals:
+                return vals[0]
+        return None
+
+    def ids_value() -> list:
+        vals = q.get("ids") or q.get("ids[]") or []
+        if len(vals) > 1:
+            return vals
+        if not vals:
+            return []
+        text = str(vals[0]).strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, list) else [parsed]
+            except Exception:  # noqa: BLE001
+                pass
+        return [x for x in text.split(",") if x.strip()]
+
+    default_blob = one("default")
+    default_mode = one("default_mode", "default[mode]")
+    default_ids_raw = q.get("default_ids") or q.get("default_ids[]") or q.get("default[ids]")
+    if default_blob is not None or default_mode is not None or default_ids_raw:
+        default: dict = {}
+        if default_blob:
+            try:
+                parsed = json.loads(default_blob)
+            except Exception as e:  # noqa: BLE001
+                raise _PMWriteError(f"default 表单字段不是合法 JSON：{e}", 400, "bad_form") from e
+            if not isinstance(parsed, dict):
+                raise _PMWriteError("default 表单字段必须是对象", 400, "bad_form")
+            default.update(parsed)
+        if default_mode is not None:
+            default["mode"] = default_mode
+        if default_ids_raw:
+            default["ids"] = default_ids_raw if len(default_ids_raw) > 1 else ids_value_from_raw(default_ids_raw[0])
+        return {"default": default}
+
+    payload = {}
+    user_key = one("user_key")
+    mode = one("mode")
+    if user_key is not None:
+        payload["user_key"] = user_key
+    if mode is not None:
+        payload["mode"] = mode
+    payload["ids"] = ids_value()
+    return payload
+
+
+def ids_value_from_raw(raw: Any) -> list:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except Exception:  # noqa: BLE001
+            pass
+    return [x for x in text.split(",") if x.strip()]
+
+
+def _pm_user_rows_for_write() -> list[dict]:
+    rows = _user_table_rows()
+    if not rows:
+        raise _PMWriteError("读不到飞牛用户表（music.db），已拒绝写入", 409, "user_table_unavailable")
+    return rows
+
+
+def _pm_resolve_user_key(user_key: Any) -> str:
+    key = str(user_key or "").strip()
+    if not key:
+        raise _PMWriteError("user_key 不能为空", 400, "invalid_user")
+    rows = _pm_user_rows_for_write()
+    if any(str(r.get("guid") or "") == key for r in rows):
+        return key
+    matches = [r for r in rows if str(r.get("name") or "") == key]
+    if len(matches) == 1:
+        return key
+    if len(matches) > 1:
+        raise _PMWriteError("用户名不唯一，请改用完整 guid", 400, "ambiguous_user")
+    raise _PMWriteError("找不到该用户；请使用完整 guid 或唯一的用户名", 400, "unknown_user")
+
+
+def _pm_read_config_for_write(path: str) -> dict:
+    if not os.path.exists(path):
+        return _pm_empty()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[PLAYLIST_MAP] 写前解析 %s 失败：%s；已拒绝写入", path, e)
+        raise _PMWriteError(
+            f"现有 playlist_map.json 解析失败（{e}），已拒绝写入",
+            409,
+            "existing_config_invalid",
+        ) from e
+    norm = _pm_normalize(raw)
+    if norm is None:
+        logger.warning("[PLAYLIST_MAP] 写前检查 %s 结构不可用；已拒绝写入", path)
+        raise _PMWriteError("现有 playlist_map.json 结构不可用，已拒绝写入",
+                            409, "existing_config_invalid")
+    return norm
+
+
+def _pm_write_config_atomic(path: str, cfg: dict) -> None:
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    data = {
+        "users": {k: _pm_brief_rule(v) for k, v in (cfg.get("users") or {}).items()},
+        "default": _pm_brief_rule(cfg.get("default") or {"mode": "all", "ids": frozenset()}),
+    }
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".playlist_map.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            os.chown(tmp_path, 0, 0)
+        os.replace(tmp_path, path)
+        tmp_path = ""
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[PLAYLIST_MAP] 写入 %s 失败：%s", path, e)
+        raise _PMWriteError(f"写入 playlist_map.json 失败：{e}", 500, "write_failed") from e
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _pm_apply_save_payload(payload: dict) -> None:
+    if "default" in payload:
+        if "user_key" in payload:
+            raise _PMWriteError("default 与 user_key 不能同时提交", 400, "invalid_payload")
+        rule = _pm_norm_rule(payload.get("default"), "request.default")
+        if rule is None:
+            raise _PMWriteError("default 规则不合法", 400, "invalid_rule")
+        path = playlist_map_path()
+        cfg = _pm_read_config_for_write(path)
+        cfg["default"] = rule
+        _pm_write_config_atomic(path, cfg)
+    else:
+        if "user_key" not in payload:
+            raise _PMWriteError("缺少 user_key 或 default", 400, "invalid_payload")
+        rule = _pm_norm_rule(
+            {"mode": payload.get("mode"), "ids": payload.get("ids")},
+            "request.user",
+        )
+        if rule is None:
+            raise _PMWriteError("用户规则不合法", 400, "invalid_rule")
+        user_key = _pm_resolve_user_key(payload.get("user_key"))
+        path = playlist_map_path()
+        cfg = _pm_read_config_for_write(path)
+        users = cfg.get("users") or {}
+        rows = _user_table_rows()
+        canonical_guid = next(
+            (str(r.get("guid") or "") for r in rows if str(r.get("guid") or "") == user_key),
+            "",
+        )
+        if not canonical_guid:
+            canonical_guid = next(
+                (str(r.get("guid") or "") for r in rows if str(r.get("name") or "") == user_key),
+                "",
+            )
+        canonical_name = next(
+            (str(r.get("name") or "") for r in rows if str(r.get("guid") or "") == canonical_guid),
+            "",
+        )
+        for alias in {canonical_guid, canonical_name, user_key}:
+            if alias:
+                users.pop(alias, None)
+        users[user_key] = rule
+        cfg["users"] = users
+        _pm_write_config_atomic(path, cfg)
+
+    _PM_CACHE.update({"mtime": None, "data": None, "checked": 0.0})
+    _PM_CATALOG_CACHE.update({"ts": 0.0, "data": None, "key": ""})
 
 
 def playlist_map_path() -> str:
@@ -8182,8 +8567,10 @@ def load_playlist_map() -> dict:
     try:
         st = os.stat(path)
     except OSError:
+        # 文件缺失 = 撤销配置 ⇒ 必须与"重启后无配置"一致：回退为空（不过滤）。
+        # 与"文件损坏"要区分：损坏时保留上次有效（见 _keep_last），那是保守例外。
         if (_PM_CACHE["data"] or {}).get("users"):
-            logger.warning("[PLAYLIST_MAP] %s 已消失，沿用上次有效配置（%d 条规则）",
+            logger.warning("[PLAYLIST_MAP] %s 已消失，回退为空配置（原 %d 条规则不再生效，将不过滤）",
                            path, len(_PM_CACHE["data"]["users"]))
         _PM_CACHE["mtime"] = None
         _PM_CACHE["data"] = _pm_empty()
@@ -8284,6 +8671,51 @@ def _user_table_map() -> dict[str, str]:
     return out
 
 
+def _user_table_rows() -> list[dict]:
+    """music.db 的 user 表：返回 [{guid, name}]，列名自适应，guid 列必需。"""
+    db = str(CONF.get("music_db") or "")
+    if not db or not os.path.exists(db):
+        return []
+    out: list[dict] = []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            cols = [str(d[1]) for d in con.execute("PRAGMA table_info(user)").fetchall()]
+            if not cols:
+                raise RuntimeError("user 表不存在")
+            low = {c.lower(): c for c in cols}
+            guid_col = low.get("guid")
+            name_cols = [
+                low[k] for k in (
+                    "name", "username", "nickname", "displayname", "nick",
+                    "name_latin_full", "name_latin",
+                )
+                if k in low
+            ]
+            if not guid_col or not name_cols:
+                raise RuntimeError(f"user 表列名不符预期（有 {cols}）")
+            sel = ", ".join([guid_col] + name_cols)
+            rows = con.execute(f"SELECT {sel} FROM user").fetchall()
+        finally:
+            con.close()
+        seen: set[str] = set()
+        for row in rows:
+            guid = str(row[0] or "").strip()
+            if not guid or guid in seen:
+                continue
+            seen.add(guid)
+            name = ""
+            for value in row[1:]:
+                text = str(value or "").strip()
+                if text:
+                    name = text
+                    break
+            out.append({"guid": guid, "name": name})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[PLAYLIST_MAP] 枚举 music.db user 表失败：%s", e)
+    return out
+
+
 _UC_CACHE: dict[str, tuple[str, str, float]] = {}
 _UC_TTL = 300.0        # 命中后 5 分钟
 _UC_TTL_NEG = 60.0     # 未登录也缓存，别让扫描/后台任务每次都打 /user/me
@@ -8352,6 +8784,8 @@ def playlist_allow(rule: dict, playlist_id: str) -> bool:
 
 def filter_playlist_bundles(bundles: list[dict], guid: str, name: str) -> list[dict]:
     """只过滤酷狗来源的歌单（injected）；官方本地歌单不经过这里。顺序不变。"""
+    global _PM_FILTER_CALLS
+    _PM_FILTER_CALLS += 1
     if not playlist_map_active():
         return bundles
     rule, hit = playlist_rule_for(guid, name)

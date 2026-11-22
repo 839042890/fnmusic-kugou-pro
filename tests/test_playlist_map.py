@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -37,6 +38,7 @@ CONF.mkdir(parents=True, exist_ok=True)
 
 DB = ROOT / "music.db"
 DB_ALT = ROOT / "music-alt.db"
+DB_DUP = ROOT / "music-dup.db"
 
 
 def _mk_db(path: Path, guid_col: str, name_col: str, rows: list[tuple[str, str]]) -> None:
@@ -53,6 +55,7 @@ GUID_A = "a" * 64          # 飞牛用户 A
 GUID_B = "b" * 64          # 飞牛用户 B
 _mk_db(DB, "guid", "name", [(GUID_A, "alice"), (GUID_B, "bob")])
 _mk_db(DB_ALT, "guid", "username", [(GUID_A, "alice-alt")])
+_mk_db(DB_DUP, "guid", "name", [(GUID_A, "same-name"), (GUID_B, "same-name")])
 
 # 某些飞牛版本 name 存在但留空，真实显示名在 name_latin_full
 DB_LATIN = ROOT / "music_latin.db"
@@ -115,6 +118,7 @@ def case(name: str, fn) -> None:
 def reset() -> None:
     """清掉三个缓存，让下一次调用真的去读文件/读库。"""
     app._PM_CACHE.update({"mtime": None, "data": None, "checked": 0.0})
+    app._PM_CATALOG_CACHE.update({"ts": 0.0, "data": None})
     app._UC_CACHE.clear()
     app._GUID_NAME_CACHE.update({"ts": 0.0, "map": {}})
 
@@ -142,6 +146,7 @@ G3 = app.kugou_playlist_guid(PID_A3, "歌单3")
 STATE = {
     "authed": True,
     "guid": GUID_A,
+    "login_state": "valid",
     "bundles": [],
     "detail_obj_calls": [],        # 记录"回源酷狗 detail"被调用了几次
     "list_calls": 0,
@@ -177,6 +182,11 @@ async def fake_envelope(request, client):
     return {"code": 0, "msg": "ok", "data": {"list": []}}
 
 
+async def fake_login_probe(force: bool = False):
+    return {"state": STATE["login_state"], "status": 1, "error_code": 0,
+            "detail": "fake", "checked_at": 0.0, "cached": False}
+
+
 async def fake_detail_obj(request, guid):
     STATE["detail_obj_calls"].append(guid)
     return {"guid": guid, "name": "回源来的", "trackCount": 0, "source": "kugou"}
@@ -193,6 +203,7 @@ async def fake_tracks_full(fastapi_app, guid):
 app._probe_upstream_auth = fake_probe
 app.fetch_kugou_user_playlist_bundles = fake_bundles
 app.fetch_upstream_envelope = fake_envelope
+app.kugou_source.probe_login_state = fake_login_probe
 app._fetch_kugou_playlist_detail_obj = fake_detail_obj
 app.fetch_kugou_playlist_tracks = fake_tracks
 app.fetch_kugou_playlist_tracks_full = fake_tracks_full
@@ -202,6 +213,7 @@ def reset_state(**kw) -> None:
     STATE.update({
         "authed": True,
         "guid": GUID_A,
+        "login_state": "valid",
         "bundles": _mk_bundles(),
         "detail_obj_calls": [],
         "list_calls": 0,
@@ -210,6 +222,8 @@ def reset_state(**kw) -> None:
         "raise_probe": False,
     })
     STATE.update(kw)
+    app.CONF["kugou_token"] = "test-token"
+    app.CONF["kugou_enabled"] = True
     reset()
 
 
@@ -579,6 +593,261 @@ async def e_diag_endpoint(client) -> None:
     assert GUID_A not in raw, "诊断端点给了完整 guid"
 
 
+# ==================== 6. 写接口 / catalog / 统计 ====================
+class _LogCapture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def t_whitelist_empty_allows_with_warning() -> None:
+    reset_state()
+    cap = _LogCapture()
+    app.logger.addHandler(cap)
+    try:
+        write_map({"users": {"alice": {"mode": "whitelist", "ids": []}}})
+        app.load_playlist_map()
+        kept = app.filter_playlist_bundles([dict(b) for b in STATE["bundles"]], GUID_A, "alice")
+    finally:
+        app.logger.removeHandler(cap)
+    assert [b["name"] for b in kept] == ["歌单1", "歌单2", "歌单3"], kept
+    assert any("whitelist 但 ids 为空" in m for m in cap.messages), cap.messages
+
+
+def t_blacklist_empty_equiv_all() -> None:
+    reset_state()
+    write_map({"users": {"alice": {"mode": "blacklist", "ids": []}}})
+    kept = app.filter_playlist_bundles([dict(b) for b in STATE["bundles"]], GUID_A, "alice")
+    assert [b["name"] for b in kept] == ["歌单1", "歌单2", "歌单3"], kept
+
+
+def t_bad_json_warns_and_keeps_last() -> None:
+    reset_state()
+    write_map({"users": {"alice": {"mode": "blacklist", "ids": [PID_A2]}}})
+    app.load_playlist_map()
+    cap = _LogCapture()
+    app.logger.addHandler(cap)
+    try:
+        MAP_FILE.write_text("{ broken", encoding="utf-8")
+        app._PM_CACHE["checked"] = 0.0
+        cfg = app.load_playlist_map()
+    finally:
+        app.logger.removeHandler(cap)
+    assert cfg["users"]["alice"]["mode"] == "blacklist", cfg
+    assert any("playlist_map.json" in m and "解析失败" in m for m in cap.messages), cap.messages
+
+
+async def a_catalog_ok(client) -> None:
+    reset_state()
+    write_map({
+        "users": {"alice": {"mode": "blacklist", "ids": [PID_A2]}},
+        "default": {"mode": "all", "ids": []},
+    })
+    r = await client.get("/_ext/playlist_map/catalog")
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["status"] == "ok", payload
+    assert payload["cached"] is False, payload
+    assert GUID_A not in r.text and GUID_B not in r.text, "catalog 泄漏了完整 guid"
+    assert "test-token" not in r.text, "catalog 泄漏了 token"
+
+    users = {u["name"]: u for u in payload["users"]}
+    assert users["alice"]["guid_short"] == GUID_A[:8], users
+    assert users["alice"]["rule"] == {"mode": "blacklist", "ids": [PID_A2]}, users
+    assert users["bob"]["rule"] == {"mode": "all", "ids": []}, users
+    assert payload["default"] == {"mode": "all", "ids": []}, payload
+    assert payload["playlists"][0] == {
+        "id": PID_A1, "name": "歌单1", "track_count": 3, "is_feed": False,
+    }, payload["playlists"]
+    assert [p["track_count"] for p in payload["playlists"]] == [3, 5, 7], payload
+
+    calls = STATE["list_calls"]
+    r2 = await client.get("/_ext/playlist_map/catalog")
+    assert r2.status_code == 200 and r2.json()["cached"] is True, r2.text
+    assert STATE["list_calls"] == calls, "60 秒缓存未生效"
+
+
+async def a_catalog_not_logged(client) -> None:
+    reset_state()
+    write_map({"users": {"alice": {"mode": "all"}}})
+    ok = await client.get("/_ext/playlist_map/catalog")
+    assert ok.status_code == 200, ok.text
+    old = app.CONF["kugou_token"]
+    app.CONF["kugou_token"] = ""
+    try:
+        r = await client.get("/_ext/playlist_map/catalog")
+    finally:
+        app.CONF["kugou_token"] = old
+    assert r.status_code == 401, r.text
+    payload = r.json()
+    assert payload["status"] == "error", payload
+    assert payload["code"] == "kugou_not_logged_in", payload
+    assert payload.get("message"), payload
+    assert "users" not in payload and "playlists" not in payload, "未登录时用空数组冒充成功"
+
+
+async def a_catalog_invalid_login(client) -> None:
+    reset_state(login_state="invalid")
+    write_map({"users": {"alice": {"mode": "all"}}})
+    r = await client.get("/_ext/playlist_map/catalog")
+    assert r.status_code == 401, r.text
+    assert r.json()["code"] == "kugou_login_invalid", r.text
+
+
+def _assert_rule_equal(actual: dict, expected: dict) -> None:
+    assert actual["mode"] == expected["mode"], (actual, expected)
+    assert sorted(actual["ids"]) == sorted(expected["ids"]), (actual, expected)
+
+
+async def a_post_roundtrip_equiv(client) -> None:
+    reset_state()
+    rm_map()
+
+    payload = {"user_key": "alice", "mode": "whitelist", "ids": [PID_A1]}
+    r = await client.post("/_ext/playlist_map", json=payload)
+    assert r.status_code == 200 and r.json()["status"] == "ok", r.text
+    assert "alice" not in r.text and GUID_A not in r.text, "POST 响应不该回显用户键/guid"
+    saved = json.loads(MAP_FILE.read_text(encoding="utf-8"))
+    _assert_rule_equal(saved["users"]["alice"], payload)
+    read = await client.get("/_ext/playlist_map")
+    _assert_rule_equal(read.json()["users"]["alice"], payload)
+
+    payload_guid = {"user_key": GUID_B, "mode": "blacklist", "ids": [PID_A2, PID_A3]}
+    r = await client.post("/_ext/playlist_map", json=payload_guid)
+    assert r.status_code == 200, r.text
+    assert GUID_B not in r.text, "POST 响应回显了完整 guid"
+    saved = json.loads(MAP_FILE.read_text(encoding="utf-8"))
+    _assert_rule_equal(saved["users"][GUID_B], payload_guid)
+    read = await client.get("/_ext/playlist_map")
+    _assert_rule_equal(read.json()["users"][GUID_B], payload_guid)
+
+    payload_default = {"default": {"mode": "blacklist", "ids": [PID_A3]}}
+    r = await client.post("/_ext/playlist_map", json=payload_default)
+    assert r.status_code == 200, r.text
+    saved = json.loads(MAP_FILE.read_text(encoding="utf-8"))
+    _assert_rule_equal(saved["default"], payload_default["default"])
+    read = await client.get("/_ext/playlist_map")
+    _assert_rule_equal(read.json()["default"], payload_default["default"])
+
+
+async def a_post_short_guid_rejected(client) -> None:
+    reset_state()
+    write_map({"users": {"alice": {"mode": "all"}}})
+    before = MAP_FILE.read_text(encoding="utf-8")
+    r = await client.post("/_ext/playlist_map", json={
+        "user_key": GUID_A[:8], "mode": "whitelist", "ids": [PID_A1],
+    })
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == "unknown_user", r.text
+    assert MAP_FILE.read_text(encoding="utf-8") == before, "截断 guid 请求改动了配置"
+    assert GUID_A[:8] not in MAP_FILE.read_text(encoding="utf-8"), "截断 guid 被写进配置"
+
+
+async def a_post_duplicate_name_rejected(client) -> None:
+    reset_state()
+    rm_map()
+    old_db = app.CONF["music_db"]
+    app.CONF["music_db"] = str(DB_DUP)
+    app._GUID_NAME_CACHE.update({"ts": 0.0, "map": {}})
+    try:
+        r = await client.post("/_ext/playlist_map", json={
+            "user_key": "same-name", "mode": "whitelist", "ids": [PID_A1],
+        })
+        assert r.status_code == 400, r.text
+        assert r.json()["code"] == "ambiguous_user", r.text
+        assert not MAP_FILE.exists(), "用户名不唯一时仍写了配置"
+
+        r = await client.post("/_ext/playlist_map", json={
+            "user_key": GUID_A, "mode": "whitelist", "ids": [PID_A1],
+        })
+        assert r.status_code == 200, r.text
+        saved = json.loads(MAP_FILE.read_text(encoding="utf-8"))
+        assert GUID_A in saved["users"] and "same-name" not in saved["users"], saved
+    finally:
+        app.CONF["music_db"] = old_db
+        app._GUID_NAME_CACHE.update({"ts": 0.0, "map": {}})
+
+
+async def a_post_broken_existing_rejected(client) -> None:
+    reset_state()
+    MAP_FILE.write_text("{ broken", encoding="utf-8")
+    before = MAP_FILE.read_text(encoding="utf-8")
+    r = await client.post("/_ext/playlist_map", json={
+        "default": {"mode": "blacklist", "ids": [PID_A2]},
+    })
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "existing_config_invalid", r.text
+    assert MAP_FILE.read_text(encoding="utf-8") == before, "坏 JSON 被覆盖了"
+    assert not list(CONF.glob(".playlist_map.*.tmp")), "失败后残留临时文件"
+
+
+async def a_post_cross_site_rejected(client) -> None:
+    reset_state()
+    write_map({"users": {"alice": {"mode": "all"}}})
+    before = MAP_FILE.read_text(encoding="utf-8")
+    r = await client.post("/_ext/playlist_map", json={
+        "default": {"mode": "blacklist", "ids": [PID_A2]},
+    }, headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "cross_site_rejected", r.text
+    assert MAP_FILE.read_text(encoding="utf-8") == before
+
+
+async def a_post_unsupported_content_type(client) -> None:
+    reset_state()
+    write_map({"users": {"alice": {"mode": "all"}}})
+    before = MAP_FILE.read_text(encoding="utf-8")
+    r = await client.post("/_ext/playlist_map", content=b"user_key=alice",
+                          headers={"Content-Type": "text/plain"})
+    assert r.status_code == 415, r.text
+    assert MAP_FILE.read_text(encoding="utf-8") == before
+
+
+async def a_post_form_and_mode(client) -> None:
+    reset_state()
+    rm_map()
+    r = await client.post("/_ext/playlist_map", data={
+        "user_key": "alice", "mode": "blacklist", "ids": PID_A2,
+    })
+    assert r.status_code == 200, r.text
+    saved = json.loads(MAP_FILE.read_text(encoding="utf-8"))
+    assert saved["users"]["alice"] == {"mode": "blacklist", "ids": [PID_A2]}, saved
+    assert (MAP_FILE.stat().st_mode & 0o777) == 0o640, oct(MAP_FILE.stat().st_mode & 0o777)
+    assert not list(CONF.glob(".playlist_map.*.tmp")), "成功写入后残留临时文件"
+
+
+async def a_catalog_refreshes_after_write(client) -> None:
+    reset_state()
+    rm_map()
+    r = await client.get("/_ext/playlist_map/catalog")
+    assert r.status_code == 200 and r.json()["default"]["mode"] == "all", r.text
+    calls = STATE["list_calls"]
+    r = await client.post("/_ext/playlist_map", json={
+        "default": {"mode": "blacklist", "ids": [PID_A2]},
+    })
+    assert r.status_code == 200, r.text
+    r = await client.get("/_ext/playlist_map/catalog")
+    assert r.status_code == 200, r.text
+    assert r.json()["default"] == {"mode": "blacklist", "ids": [PID_A2]}, r.text
+    assert STATE["list_calls"] == calls + 1, "保存后 catalog 缓存没有失效"
+
+
+async def a_stats_counter(client) -> None:
+    r = await client.get("/_ext/playlist_map/stats")
+    assert r.status_code == 200, r.text
+    n = r.json()["filter_playlist_bundles_calls"]
+    assert isinstance(n, int), r.text
+    assert isinstance(r.json()["calls"], int), r.text
+    app.filter_playlist_bundles([], "", "")
+    r2 = await client.get("/_ext/playlist_map/stats")
+    assert r2.json()["filter_playlist_bundles_calls"] == n + 1, (n, r2.text)
+    r3 = await client.get("/_ext/playlist_map/stats")
+    assert r3.json()["filter_playlist_bundles_calls"] == n + 1, r3.text
+
+
 # ==================== 8. 阴性对照 ====================
 async def n_negative_control(client) -> None:
     """把过滤函数换成恒等（= 逻辑被注掉），命中用例必须变红。
@@ -739,6 +1008,25 @@ async def main() -> None:
         await _acase("歌曲列表：被屏蔽 → list:[] total:0", e_track_list_blocked, client)
         await _acase("歌曲列表：未屏蔽 → 正常", e_track_list_allowed, client)
         await _acase("诊断端点：不泄漏 Authorization / 完整 guid", e_diag_endpoint, client)
+
+        print("\n" + "=" * 72)
+        print("6) 写接口 / catalog / 统计")
+        print("=" * 72)
+        case("whitelist + 空 ids → 放行并 WARNING", t_whitelist_empty_allows_with_warning)
+        case("blacklist + 空 ids → 等价 all", t_blacklist_empty_equiv_all)
+        case("坏 JSON → 保留上次有效并 WARNING", t_bad_json_warns_and_keeps_last)
+        await _acase("catalog：用户/歌单/规则/60 秒缓存", a_catalog_ok, client)
+        await _acase("catalog：未登录 → 可读错误码，不冒充成功", a_catalog_not_logged, client)
+        await _acase("catalog：登录失效 → 可读错误码", a_catalog_invalid_login, client)
+        await _acase("POST/GET 回读逐字段等价（用户名/full guid/default）", a_post_roundtrip_equiv, client)
+        await _acase("POST：8 位截断 guid 拒写且不改文件", a_post_short_guid_rejected, client)
+        await _acase("POST：重名用户拒绝，完整 guid 可用", a_post_duplicate_name_rejected, client)
+        await _acase("POST：现有坏 JSON 拒写且不留临时文件", a_post_broken_existing_rejected, client)
+        await _acase("POST：跨站 Origin 拒绝", a_post_cross_site_rejected, client)
+        await _acase("POST：非表单/JSON 拒绝", a_post_unsupported_content_type, client)
+        await _acase("POST：表单可用 + 0640 + 无临时残留", a_post_form_and_mode, client)
+        await _acase("POST 后 catalog 缓存立即失效", a_catalog_refreshes_after_write, client)
+        await _acase("stats：计数器只增不减且返回 int", a_stats_counter, client)
 
         print("\n" + "=" * 72)
         print("8) 阴性对照（过滤被注掉时必须变红）")
