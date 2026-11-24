@@ -8070,6 +8070,8 @@ async def static_cover(request: Request, subpath: str = ""):
 # === online favorites ===
 
 _FAV_LOCK = asyncio.Lock()
+_FAV_IMPORT_LIMIT = 300
+_KUGOU_TRACK_GUID_PREFIX = "online:kugou:"
 
 
 def sanitize_user_guid(guid: str | None) -> str:
@@ -8086,35 +8088,112 @@ def user_fav_path(user_guid: str) -> str:
     return os.path.join(fav_dir, f"{safe_name}.json")
 
 
-def load_online_favorites(user_guid: str) -> list[dict]:
-    path = user_fav_path(user_guid)
-    if not os.path.exists(path):
-        return []
+def _favorite_track_guid_from_body(body: Any) -> str:
+    """飞牛前端发 trackGuid（小写 uid）；兼容历史 trackGUID / guid。"""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("trackGuid", "trackGUID", "guid"):
+        value = body.get(key)
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _favorite_track_hash(guid: str | None) -> str:
+    """online:kugou:<hash> -> 小写 hash；判重唯一标准。"""
+    text = str(guid or "").strip()
+    if not text.startswith(_KUGOU_TRACK_GUID_PREFIX):
+        return ""
+    return text[len(_KUGOU_TRACK_GUID_PREFIX):].strip().lower()
+
+
+def _favorite_item_guid(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    guid = str(item.get("guid") or "").strip()
+    if guid:
+        return guid
+    track = item.get("track")
+    if isinstance(track, dict):
+        return str(track.get("guid") or "").strip()
+    return ""
+
+
+def _favorite_item_hash(item: Any) -> str:
+    return _favorite_track_hash(_favorite_item_guid(item))
+
+
+def _favorite_created_at(value: Any) -> int:
     try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _favorite_corrupt_path(path: str) -> str:
+    stamp = time.time_ns()
+    candidate = f"{path}.corrupt-{stamp}"
+    while os.path.exists(candidate):
+        stamp += 1
+        candidate = f"{path}.corrupt-{stamp}"
+    return candidate
+
+
+def load_online_favorites(user_guid: str) -> list[dict]:
+    """读取收藏；任何异常都在本函数内消化，坏文件留备份后返回空列表。"""
+    path = ""
+    try:
+        path = user_fav_path(user_guid)
+        if not os.path.exists(path):
+            return []
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get("items"), list):
-                return data["items"]
-            if isinstance(data, list):
-                return data
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            items = data["items"]
+        elif isinstance(data, list):
+            items = data
+        else:
+            raise ValueError(f"unexpected root type: {type(data).__name__}")
+        if not all(isinstance(item, dict) for item in items):
+            raise ValueError("items contains non-object entry")
+        return items
     except Exception as e:
-        logger.warning("Failed to load online favorites for %s from %s: %s", user_guid, path, e)
+        logger.warning(
+            "[ONLINE_FAVORITES] 读取失败，已隔离 file=%s user=%s error=%s: %s",
+            path or "<unknown>", user_guid, type(e).__name__, e,
+        )
+        if path:
+            try:
+                if os.path.exists(path):
+                    os.replace(path, _favorite_corrupt_path(path))
+            except Exception as rename_error:  # noqa: BLE001
+                logger.warning(
+                    "[ONLINE_FAVORITES] 隔离坏文件失败 file=%s error=%s: %s",
+                    path, type(rename_error).__name__, rename_error,
+                )
     return []
 
 
 def save_online_favorites(user_guid: str, items: list[dict]) -> bool:
     path = user_fav_path(user_guid)
     parent = os.path.dirname(path) or "."
-    part_path = f"{path}.{uuid4().hex[:8]}.part"
+    part_path = ""
     try:
         os.makedirs(parent, exist_ok=True)
-        with open(part_path, "w", encoding="utf-8") as f:
+        fd, part_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=parent,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"items": items}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(part_path, path)
+        part_path = ""
         return True
     except Exception as e:
         logger.warning("Failed to save online favorites for %s to %s: %s", user_guid, path, e)
-        if os.path.exists(part_path):
+        if part_path and os.path.exists(part_path):
             try:
                 os.remove(part_path)
             except Exception:
@@ -8175,6 +8254,86 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
         "createdAt": ts,
         "updatedAt": ts,
     }
+
+
+def _resolve_online_favorite_user(user_key: str) -> str:
+    """完整 user.guid 或唯一用户名 -> user.guid；8 位 short guid 不会命中。"""
+    raw = str(user_key or "").strip()
+    if not raw:
+        return ""
+    rows = _user_table_rows()
+    for row in rows:
+        if str(row.get("guid") or "").strip() == raw:
+            return raw
+    matches = [row for row in rows if str(row.get("name") or "").strip() == raw]
+    if len(matches) == 1:
+        return str(matches[0].get("guid") or "").strip()
+    return ""
+
+
+async def _resolve_online_favorite_playlist(playlist_id: str) -> dict | None:
+    target = str(playlist_id or "").strip()
+    if not target:
+        return None
+    for bundle in await fetch_kugou_user_playlist_bundles():
+        if not isinstance(bundle, dict):
+            continue
+        guid = str(bundle.get("guid") or "")
+        if is_kugou_feed_guid(guid):
+            continue
+        if kugou_playlist_id_from_guid(guid) == target:
+            return bundle
+    return None
+
+
+def _online_favorite_import_limit(value: Any) -> int | None:
+    if value in (None, ""):
+        return _FAV_IMPORT_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return None
+    if limit < 1 or limit > _FAV_IMPORT_LIMIT:
+        return None
+    return limit
+
+
+def _favorite_raw_track(item: Any) -> dict:
+    """歌单原始 item -> 收藏构造输入；只从 hash/guid 取唯一标识，绝不靠标题。"""
+    if not isinstance(item, dict):
+        return {}
+    raw = kugou_source.track_item_to_raw(item) if item.get("hash") else {}
+    if not raw:
+        candidate = str(item.get("guid") or item.get("id") or "").strip()
+        track_hash = ""
+        if candidate.startswith(_KUGOU_TRACK_GUID_PREFIX):
+            track_hash = candidate[len(_KUGOU_TRACK_GUID_PREFIX):].strip()
+        elif candidate.startswith("kugou:"):
+            track_hash = candidate[len("kugou:"):].strip()
+        if not track_hash:
+            return {}
+        raw = dict(item)
+        raw["hash"] = track_hash
+        raw["id"] = f"kugou:{track_hash}"
+        raw["source"] = "kugou"
+
+    for src, dst in (("title", "title"), ("name", "title"), ("artist", "artist"),
+                     ("album", "album"), ("artists", "artists"),
+                     ("duration", "duration_s"), ("duration_s", "duration_s")):
+        if not raw.get(dst) and item.get(src) not in (None, ""):
+            raw[dst] = item.get(src)
+    return raw
+
+
+def _online_favorites_json_body(body: Any) -> dict | None:
+    return body if isinstance(body, dict) else None
+
+
+def _online_favorites_error(code: str, message: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {"status": "error", "code": code, "message": message},
+        status_code=status_code,
+    )
 
 
 async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> tuple[bool, str, Response | None]:
@@ -8841,17 +9000,13 @@ def playlist_blocked_detail_payload() -> dict:
 
 @app.post("/music/api/v1/favorite-track/create")
 async def favorite_track_create(request: Request):
-    if not _is_get_request(request):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    guid = ""
-    if isinstance(body, dict):
-        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+    guid = _favorite_track_guid_from_body(body)
 
     if not is_online_guid(guid):
         return await forward_to_upstream(request, upstream_client)
@@ -8883,11 +9038,16 @@ async def favorite_track_create(request: Request):
 
     track_obj = build_favorite_track_obj(guid, info, created_at=now)
 
+    saved = False
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
-            # 查重
-            idx = next((i for i, it in enumerate(items) if it.get("guid") == guid), None)
+            guid_hash = _favorite_track_hash(guid)
+            idx = next((
+                i for i, it in enumerate(items)
+                if (_favorite_item_hash(it) and _favorite_item_hash(it) == guid_hash)
+                or (not guid_hash and _favorite_item_guid(it) == guid)
+            ), None)
             if idx is not None:
                 # 幂等更新
                 items[idx]["track"] = track_obj
@@ -8897,26 +9057,27 @@ async def favorite_track_create(request: Request):
                     "createdAt": now,
                     "track": track_obj,
                 })
-            save_online_favorites(user_guid, items)
+            saved = save_online_favorites(user_guid, items)
         except Exception as e:
             logger.warning("Error updating online favorites for user %s: %s", user_guid, e)
 
+    if not saved:
+        return JSONResponse(
+            content={"code": 500, "msg": "收藏保存失败", "data": None},
+            status_code=500,
+        )
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
 @app.post("/music/api/v1/favorite-track/delete")
 async def favorite_track_delete(request: Request):
-    if not _is_get_request(request):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    guid = ""
-    if isinstance(body, dict):
-        guid = str(body.get("trackGUID") or body.get("guid") or "").strip()
+    guid = _favorite_track_guid_from_body(body)
 
     if not is_online_guid(guid):
         return await forward_to_upstream(request, upstream_client)
@@ -8925,14 +9086,28 @@ async def favorite_track_delete(request: Request):
     if not is_authed and auth_resp is not None:
         return auth_resp
 
+    removed = False
+    saved = True
     async with _FAV_LOCK:
         try:
             items = load_online_favorites(user_guid)
-            items = [it for it in items if it.get("guid") != guid]
-            save_online_favorites(user_guid, items)
+            guid_hash = _favorite_track_hash(guid)
+            def _same(item: dict) -> bool:
+                if guid_hash:
+                    return bool(_favorite_item_hash(item)) and _favorite_item_hash(item) == guid_hash
+                return _favorite_item_guid(item) == guid
+            kept = [it for it in items if not _same(it)]
+            removed = len(kept) != len(items)
+            if removed:
+                saved = save_online_favorites(user_guid, kept)
         except Exception as e:
             logger.warning("Error deleting from online favorites for user %s: %s", user_guid, e)
 
+    if removed and not saved:
+        return JSONResponse(
+            content={"code": 500, "msg": "收藏保存失败", "data": None},
+            status_code=500,
+        )
     return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
 
@@ -9021,6 +9196,185 @@ async def favorite_track_list(request: Request):
     data["total"] = official_total + len(online_tracks)
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
+
+
+@app.post("/_ext/online_favorites/import")
+async def ext_online_favorites_import(request: Request):
+    if not _pm_same_origin(request):
+        return JSONResponse(
+            {"status": "error", "code": "cross_site_rejected",
+             "message": "拒绝跨站来源的写入请求"},
+            status_code=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    payload = _online_favorites_json_body(body)
+    if payload is None:
+        return _online_favorites_error("invalid_payload", "请求体必须是 JSON 对象")
+
+    user_key = str(payload.get("user_key") or "").strip()
+    playlist_id = str(payload.get("playlist_id") or "").strip()
+    if not user_key or not playlist_id:
+        return _online_favorites_error("invalid_payload", "user_key 与 playlist_id 不能为空")
+
+    user_guid = _resolve_online_favorite_user(user_key)
+    if not user_guid:
+        return _online_favorites_error("unknown_user", "未知用户（请使用完整 guid 或唯一用户名）")
+
+    bundle = await _resolve_online_favorite_playlist(playlist_id)
+    if bundle is None:
+        return _online_favorites_error("unknown_playlist", "未知歌单")
+
+    limit = _online_favorite_import_limit(payload.get("limit"))
+    if limit is None:
+        return _online_favorites_error(
+            "invalid_limit", f"limit 必须在 1 到 {_FAV_IMPORT_LIMIT} 之间",
+        )
+
+    try:
+        tracks_payload = await fetch_kugou_playlist_tracks_full(request.app, bundle.get("guid") or "")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[ONLINE_FAVORITES] 拉取歌单失败 playlist=%s err=%s", playlist_id, e)
+        return _online_favorites_error("playlist_fetch_failed", "拉取歌单失败，请稍后重试", 502)
+
+    tracks_payload = tracks_payload if isinstance(tracks_payload, dict) else {}
+    raw_items = tracks_payload.get("items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    try:
+        declared_total = int(tracks_payload.get("total") or 0)
+    except (TypeError, ValueError):
+        declared_total = 0
+    total = max(declared_total, len(raw_items))
+    if total > limit:
+        return _online_favorites_error(
+            "too_many_tracks",
+            f"歌单共 {total} 首，单次最多导入 {limit} 首，请分批导入",
+        )
+
+    source = f"playlist:{playlist_id}"
+    imported = skipped = 0
+    failed = max(0, total - len(raw_items))
+    async with _FAV_LOCK:
+        items = load_online_favorites(user_guid)
+        seen_hashes = {_favorite_item_hash(it) for it in items if _favorite_item_hash(it)}
+        max_created = max((_favorite_created_at(it.get("createdAt")) for it in items), default=0)
+        next_created = max(int(time.time()), max_created + 1)
+        new_items: list[dict] = []
+
+        for raw_item in raw_items:
+            try:
+                raw = _favorite_raw_track(raw_item)
+                track_hash = str(raw.get("hash") or "").strip()
+                if not track_hash:
+                    failed += 1
+                    logger.warning("[ONLINE_FAVORITES] 跳过无 hash 曲目 playlist=%s", playlist_id)
+                    continue
+                norm_hash = track_hash.lower()
+                if norm_hash in seen_hashes:
+                    skipped += 1
+                    continue
+
+                guid = f"{_KUGOU_TRACK_GUID_PREFIX}{track_hash}"
+                raw["createdAt"] = next_created
+                raw["updatedAt"] = next_created
+                track_obj = build_favorite_track_obj(guid, raw, created_at=next_created)
+                new_items.append({
+                    "guid": guid,
+                    "source": source,
+                    "createdAt": next_created,
+                    "track": track_obj,
+                })
+                seen_hashes.add(norm_hash)
+                imported += 1
+                next_created += 1
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                logger.warning("[ONLINE_FAVORITES] 构造收藏失败 playlist=%s err=%s", playlist_id, e)
+
+        if new_items and not save_online_favorites(user_guid, items + new_items):
+            return _online_favorites_error("save_failed", "收藏保存失败", 500)
+
+    return JSONResponse({
+        "status": "ok",
+        "imported": imported,
+        "skipped": skipped,
+        "failed": failed,
+        "total": total,
+    })
+
+
+@app.get("/_ext/online_favorites")
+async def ext_online_favorites_list(request: Request):
+    if not _pm_same_origin(request):
+        return JSONResponse(
+            {"status": "error", "code": "cross_site_rejected",
+             "message": "拒绝跨站来源的读取请求"},
+            status_code=403,
+        )
+    user_key = str(request.query_params.get("user_key") or "").strip()
+    user_guid = _resolve_online_favorite_user(user_key)
+    if not user_guid:
+        return _online_favorites_error("unknown_user", "未知用户（请使用完整 guid 或唯一用户名）")
+    async with _FAV_LOCK:
+        items = load_online_favorites(user_guid)
+    return JSONResponse({
+        "status": "ok",
+        "user_key": user_guid,
+        "items": items,
+        "total": len(items),
+    })
+
+
+@app.delete("/_ext/online_favorites/import")
+async def ext_online_favorites_import_undo(request: Request):
+    if not _pm_same_origin(request):
+        return JSONResponse(
+            {"status": "error", "code": "cross_site_rejected",
+             "message": "拒绝跨站来源的写入请求"},
+            status_code=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    payload = _online_favorites_json_body(body)
+    if payload is None:
+        return _online_favorites_error("invalid_payload", "请求体必须是 JSON 对象")
+    user_key = str(payload.get("user_key") or "").strip()
+    playlist_id = str(payload.get("playlist_id") or "").strip()
+    if not user_key or not playlist_id:
+        return _online_favorites_error("invalid_payload", "user_key 与 playlist_id 不能为空")
+    user_guid = _resolve_online_favorite_user(user_key)
+    if not user_guid:
+        return _online_favorites_error("unknown_user", "未知用户（请使用完整 guid 或唯一用户名）")
+
+    source = f"playlist:{playlist_id}"
+    removed = 0
+    async with _FAV_LOCK:
+        items = load_online_favorites(user_guid)
+        kept = [it for it in items if it.get("source") != source]
+        removed = len(items) - len(kept)
+        if removed and not save_online_favorites(user_guid, kept):
+            return _online_favorites_error("save_failed", "收藏保存失败", 500)
+    return JSONResponse({"status": "ok", "removed": removed})
+
+
+@app.post("/app/fnmusic_kugou_pro/_ext/online_favorites/import")
+async def ext_online_favorites_import_gateway(request: Request):
+    return await ext_online_favorites_import(request)
+
+
+@app.get("/app/fnmusic_kugou_pro/_ext/online_favorites")
+async def ext_online_favorites_list_gateway(request: Request):
+    return await ext_online_favorites_list(request)
+
+
+@app.delete("/app/fnmusic_kugou_pro/_ext/online_favorites/import")
+async def ext_online_favorites_import_undo_gateway(request: Request):
+    return await ext_online_favorites_import_undo(request)
 
 
 # === 歌手 / 专辑详情列表 ===
