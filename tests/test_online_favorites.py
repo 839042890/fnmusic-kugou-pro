@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -250,6 +251,72 @@ def test_s1_delete_local_guid_forwarded() -> None:
     asyncio.run(inner())
 
 
+def test_s1_artist_fallbacks() -> None:
+    cases = [
+        ("SingerName", {"SingerName": "周杰伦"}),
+        ("singer_name", {"singer_name": "林俊杰"}),
+        ("Singers", {"Singers": [{"name": "五月天", "id": "42"}]}),
+    ]
+    for field, extra in cases:
+        item = {
+            "id": f"kugou:artistcase{field}",
+            "source": "kugou",
+            "title": f"{field} 曲目",
+            "duration_s": 180000,
+            "artists": [],
+            "album": "测试专辑",
+            **extra,
+        }
+        vo = app.build_online_track(item)
+        assert vo.get("artists"), (field, vo)
+        expected_name = extra[field] if field != "Singers" else extra[field][0]["name"]
+        assert vo["artists"][0].get("name") == expected_name, (field, vo["artists"])
+        assert vo.get("album", {}).get("artists") == vo["artists"], (field, vo.get("album"))
+
+    vo = app.build_online_track({
+        "id": "kugou:noartist",
+        "source": "kugou",
+        "title": "没有歌手字段",
+        "duration_s": 1000,
+        "artists": [],
+    })
+    assert len(vo.get("artists") or []) == 1, vo
+    fallback = vo["artists"][0]
+    assert fallback.get("guid") == f"{vo['guid']}:artist", fallback
+    assert fallback.get("name") == "未知歌手", fallback
+    assert vo.get("album", {}).get("artists") == vo["artists"], vo.get("album")
+
+
+def test_s1_import_keeps_singer_fields() -> None:
+    async def inner():
+        reset_state()
+        STATE["tracks"]["pid1"] = [
+            {"hash": "searchsinger", "name": "搜索曲", "SingerName": "搜索歌手",
+             "albuminfo": {"name": "搜索专辑"}, "timelen": 1000},
+            {"hash": "playlistsinger", "name": "歌单曲", "singer_name": "歌单歌手",
+             "albumname": "歌单专辑", "duration": 1000},
+            {"hash": "singersarray", "name": "数组曲",
+             "Singers": [{"name": "数组歌手", "id": "9"}],
+             "albumname": "数组专辑", "duration": 1000},
+        ]
+        r = await request("POST", "/_ext/online_favorites/import",
+                          json={"user_key": GUID_A, "playlist_id": "pid1"})
+        assert r.status_code == 200, r.text
+        assert r.json().get("imported") == 3, r.text
+        tracks = {it["track"]["title"]: it["track"] for it in fav_items()}
+        expected = {
+            "搜索曲": "搜索歌手",
+            "歌单曲": "歌单歌手",
+            "数组曲": "数组歌手",
+        }
+        for title, name in expected.items():
+            track = tracks.get(title)
+            assert track is not None, (title, tracks)
+            assert track.get("artists") and track["artists"][0].get("name") == name, (title, track)
+            assert track.get("album", {}).get("artists") == track["artists"], (title, track)
+    asyncio.run(inner())
+
+
 def test_s2_import_dedupe_counts_and_sort() -> None:
     async def inner():
         reset_state()
@@ -289,14 +356,36 @@ def test_s2_import_dedupe_counts_and_sort() -> None:
     asyncio.run(inner())
 
 
-def test_s2_limit_and_unknowns() -> None:
+def test_s3_import_limit_1000_and_unknowns() -> None:
     async def inner():
         reset_state()
-        STATE["tracks"]["pid1"] = [raw_track(f"lim{i}") for i in range(301)]
+        STATE["tracks"]["pid1"] = [raw_track(f"lim{i}") for i in range(400)]
         r = await request("POST", "/_ext/online_favorites/import",
                           json={"user_key": GUID_A, "playlist_id": "pid1"})
-        assert r.status_code == 400, r.text
-        assert "分批导入" in r.text, r.text
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert (d["imported"], d["skipped"], d["failed"], d["total"]) == (400, 0, 0, 400), d
+
+        STATE["tracks"]["pid2"] = [raw_track(f"ok{i}") for i in range(1000)]
+        r_1000 = await request("POST", "/_ext/online_favorites/import",
+                               json={"user_key": GUID_A, "playlist_id": "pid2", "limit": 1000})
+        assert r_1000.status_code == 200, r_1000.text
+        d_1000 = r_1000.json()
+        assert (d_1000["imported"], d_1000["skipped"], d_1000["failed"], d_1000["total"]) == (1000, 0, 0, 1000), d_1000
+
+        r_limit = await request("POST", "/_ext/online_favorites/import",
+                                json={"user_key": GUID_A, "playlist_id": "pid1", "limit": 1001})
+        assert r_limit.status_code == 400, r_limit.text
+        assert r_limit.json().get("code") == "invalid_limit", r_limit.text
+
+        STATE["tracks"]["pid2"] = [raw_track(f"over{i}") for i in range(1001)]
+        r_over = await request("POST", "/_ext/online_favorites/import",
+                               json={"user_key": GUID_A, "playlist_id": "pid2"})
+        assert r_over.status_code == 400, r_over.text
+        assert r_over.json().get("code") == "too_many_tracks", r_over.text
+        assert "1000" in r_over.json().get("message", ""), r_over.text
+        assert "分批导入" in r_over.json().get("message", ""), r_over.text
+
         r2 = await request("POST", "/_ext/online_favorites/import",
                            json={"user_key": GUID_A, "playlist_id": "nope"})
         assert r2.status_code == 400 and r2.json().get("code") == "unknown_playlist", r2.text
@@ -401,13 +490,79 @@ def test_s6_save_keeps_old_file_on_failure() -> None:
     assert not list(Path(app.user_fav_path(GUID_A)).parent.glob("*.tmp")), "临时文件未清理"
 
 
+def test_s2_list_sanitizes_dirty_online_track() -> None:
+    async def inner():
+        reset_state()
+        dirty_guid = "online:kugou:dirtylegacy"
+        healthy_guid = "online:kugou:healthylegacy"
+        healthy_artist = {"guid": "online:kugou:artist:7", "name": "健康歌手",
+                          "coverId": "online:kugou:artist:7", "createdAt": 2, "updatedAt": 2}
+        healthy_album = {"guid": f"{healthy_guid}:album", "name": "健康专辑",
+                         "artists": [healthy_artist], "coverId": healthy_guid,
+                         "releaseDate": 0, "barcode": "", "createdAt": 2, "updatedAt": 2}
+        write_items([{
+            "guid": dirty_guid,
+            "createdAt": 1,
+            "track": {
+                "guid": dirty_guid,
+                "title": "旧收藏",
+                "duration": 123,
+                "artists": [],
+                "album": None,
+            },
+        }, {
+            "guid": healthy_guid,
+            "createdAt": 2,
+            "track": {
+                "guid": healthy_guid,
+                "title": "健康收藏",
+                "duration": 456,
+                "artists": [healthy_artist],
+                "album": healthy_album,
+            },
+        }])
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.WARNING)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        app.logger.addHandler(handler)
+        try:
+            r = await request("GET", "/music/api/v1/favorite-track/list")
+        finally:
+            app.logger.removeHandler(handler)
+
+        assert r.status_code == 200, r.text
+        rows = r.json()["data"]["list"]
+        dirty = next((row for row in rows if row.get("guid") == dirty_guid), None)
+        assert dirty is not None, rows
+        assert dirty.get("artists"), dirty
+        assert isinstance(dirty.get("album"), dict), dirty
+        assert dirty["album"].get("name"), dirty
+        healthy = next((row for row in rows if row.get("guid") == healthy_guid), None)
+        assert healthy is not None, rows
+        assert healthy.get("artists") == [healthy_artist], healthy
+        assert healthy.get("album") == healthy_album, healthy
+        logs = stream.getvalue()
+        assert "WARNING" in logs and dirty_guid in logs, logs
+        assert "artists" in logs and "album" in logs, logs
+        assert healthy_guid not in logs, logs
+    asyncio.run(inner())
+
+
 def test_s4_settings_controls_static() -> None:
     html = (PKG / "app" / "web" / "settings.html").read_text(encoding="utf-8")
     for token in ("导入歌单到用户收藏", "btn-online-fav-import", "btn-online-fav-undo",
                   "已导入", "跳过", "失败", "撤销"):
         assert token in html, token
-    assert "<script src=" not in html and "<link rel=\"stylesheet\"" not in html, "新增了外部资源"
-    assert "https://" not in html.split("<script>", 1)[-1], "脚本里新增了外部地址"
+    section_start = html.index("导入歌单到用户收藏")
+    section_end = html.index('id="of-msg"', section_start)
+    section = html[section_start:section_end]
+    assert "300" not in section, section
+    assert "1000" in section, section
+    assert "limit:1000" in html, "导入请求仍可能硬编码旧上限"
+    assert len(re.findall(r"<link\b", html, re.I)) == 1, "外部资源引用数变化"
+    assert len(re.findall(r"<script\b[^>]*\bsrc\s*=", html, re.I)) == 0, "新增了外部脚本"
+    assert not re.search(r"(?:href|src)\s*=\s*['\"](?:https?:)?//", html, re.I), "新增了外部地址"
 
 
 print("=" * 72)
@@ -417,13 +572,15 @@ for _name, _fn in [
     ("create 本地 guid 原样透传", test_s1_local_guid_forwarded),
     ("delete 认三种字段名且幂等", test_s1_delete_fields_and_idempotent),
     ("delete 本地 guid 原样透传", test_s1_delete_local_guid_forwarded),
+    ("搜索/歌单歌手字段归一化与空歌手兜底", test_s1_artist_fallbacks),
+    ("导入链路保留搜索/歌单歌手字段", test_s1_import_keeps_singer_fields),
 ]:
     run_case(_name, _fn)
 
 print("\nS2 歌单导入")
 for _name, _fn in [
     ("hash 去重、计数守恒、可读回", test_s2_import_dedupe_counts_and_sort),
-    ("301 首拒绝、未知用户/歌单拒绝", test_s2_limit_and_unknowns),
+    ("400 首可导入、1001 上限拒绝、未知用户/歌单拒绝", test_s3_import_limit_1000_and_unknowns),
     ("跨站写入 403", test_s2_cross_site_rejected),
 ]:
     run_case(_name, _fn)
@@ -434,6 +591,7 @@ run_case("只撤销指定来源", test_s3_undo_only_source)
 print("\nS5/S6 排序与容错")
 run_case("坏 JSON 隔离且收藏页 200", test_s6_corrupt_json_isolated_and_list_ok)
 run_case("写失败保留旧文件并清理临时文件", test_s6_save_keeps_old_file_on_failure)
+run_case("收藏列表脏数据补齐歌手与专辑", test_s2_list_sanitizes_dirty_online_track)
 run_case("设置页导入控件存在且无外部资源", test_s4_settings_controls_static)
 
 print("\n结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))

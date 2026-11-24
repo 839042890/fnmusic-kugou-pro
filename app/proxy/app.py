@@ -2752,7 +2752,9 @@ def build_online_track(item: dict) -> dict:
             raw_name = str(raw_artist.get("name") or "").strip()
             if not raw_name:
                 continue
-            raw_id = str(raw_artist.get("id") or "").strip()
+            raw_id = str(
+                raw_artist.get("id") or raw_artist.get("artist_id") or raw_artist.get("SingerID") or ""
+            ).strip()
             artists_list.append({
                 "guid": f"online:kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}",
                 "name": raw_name,
@@ -2760,16 +2762,35 @@ def build_online_track(item: dict) -> dict:
                 "createdAt": created_at,
                 "updatedAt": updated_at,
             })
-    elif artist:
-        artists_list = [
-            {
-                "guid": f"{guid}:artist:1",
-                "name": artist,
-                "coverId": None,
+    if not artists_list:
+        singer_item = item
+        if not singer_item.get("singername") and singer_item.get("singer_name"):
+            singer_item = dict(item)
+            singer_item["singername"] = singer_item.get("singer_name")
+        fallback_artists = kugou_source._singers_from_any(singer_item)
+        for idx, raw_artist in enumerate(fallback_artists):
+            if not isinstance(raw_artist, dict):
+                continue
+            raw_name = str(raw_artist.get("name") or "").strip()
+            if not raw_name:
+                continue
+            raw_id = str(raw_artist.get("id") or "").strip()
+            artist_guid = f"online:kugou:artist:{raw_id}" if raw_id else f"{guid}:artist:{idx + 1}"
+            artists_list.append({
+                "guid": artist_guid,
+                "name": raw_name,
+                "coverId": artist_guid,
                 "createdAt": created_at,
                 "updatedAt": updated_at,
-            }
-        ]
+            })
+    if not artists_list:
+        artists_list = [{
+            "guid": f"{guid}:artist",
+            "name": "未知歌手",
+            "coverId": f"{guid}:artist",
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+        }]
 
     # KuGouMusicApi 没有 album 详情接口，且 /static/cover 无法解析 kugou:album:<id>。
     # 酷狗单曲 cover 本身就是专辑封面（album/v8/<albumid>_{size}.jpg），
@@ -2778,6 +2799,7 @@ def build_online_track(item: dict) -> dict:
         "guid": f"online:kugou:album:{album_id}" if album_id not in ("", None) else album_guid,
         "name": album,
         "coverId": guid,
+        "artists": artists_list,
         "releaseDate": release_date,
         "barcode": None,
         "createdAt": created_at,
@@ -8070,7 +8092,7 @@ async def static_cover(request: Request, subpath: str = ""):
 # === online favorites ===
 
 _FAV_LOCK = asyncio.Lock()
-_FAV_IMPORT_LIMIT = 300
+_FAV_IMPORT_LIMIT = 1000
 _KUGOU_TRACK_GUID_PREFIX = "online:kugou:"
 
 
@@ -8210,16 +8232,31 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
     now = int(time.time())
     ts = created_at or now
 
-    artist_name = vo.get("artist") or ""
-    artists_list = [
-        {
+    vo_artists = vo.get("artists")
+    artists_list: list[dict] = []
+    if isinstance(vo_artists, list):
+        for raw_artist in vo_artists:
+            if not isinstance(raw_artist, dict):
+                continue
+            artist_name = str(raw_artist.get("name") or "").strip()
+            if not artist_name:
+                continue
+            artist_guid = str(raw_artist.get("guid") or f"{guid}:artist").strip()
+            artists_list.append({
+                "guid": artist_guid,
+                "name": artist_name,
+                "coverId": raw_artist.get("coverId") or artist_guid,
+                "createdAt": ts,
+                "updatedAt": ts,
+            })
+    if not artists_list:
+        artists_list = [{
             "guid": f"{guid}:artist",
-            "name": artist_name,
-            "coverId": guid,
+            "name": "未知歌手",
+            "coverId": f"{guid}:artist",
             "createdAt": ts,
             "updatedAt": ts,
-        }
-    ] if artist_name else []
+        }]
 
     album_name = (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
     album_obj = {
@@ -8254,6 +8291,118 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
         "createdAt": ts,
         "updatedAt": ts,
     }
+
+
+def _favorite_artist_objs(raw_artists: Any, track_guid: str, ts: int) -> tuple[list[dict], bool]:
+    """把收藏里的 artists 归一成前端可渲染对象；返回 (列表, 是否有补齐)。"""
+    artists: list[dict] = []
+    repaired = False
+    if not isinstance(raw_artists, list):
+        return artists, True
+    for idx, raw_artist in enumerate(raw_artists):
+        if not isinstance(raw_artist, dict):
+            repaired = True
+            continue
+        name = str(raw_artist.get("name") or "").strip()
+        if not name:
+            repaired = True
+            continue
+        artist_guid = str(raw_artist.get("guid") or "").strip()
+        if not artist_guid:
+            artist_guid = f"{track_guid}:artist:{idx + 1}"
+            repaired = True
+        cover_id = str(raw_artist.get("coverId") or "").strip()
+        if not cover_id:
+            cover_id = artist_guid
+            repaired = True
+        artists.append({
+            "guid": artist_guid,
+            "name": name,
+            "coverId": cover_id,
+            "createdAt": _favorite_created_at(raw_artist.get("createdAt")) or ts,
+            "updatedAt": _favorite_created_at(raw_artist.get("updatedAt")) or ts,
+        })
+    return artists, repaired
+
+
+def _repair_online_favorite_track(raw_track: Any, fallback_guid: str = "", created_at: Any = 0) -> dict | None:
+    """返回前自检在线收藏条目；缺字段就地补默认值，避免一条脏数据拖白整页。"""
+    track = dict(raw_track) if isinstance(raw_track, dict) else {}
+    repaired: set[str] = set()
+    ts = _favorite_created_at(created_at) or int(time.time())
+
+    guid = str(track.get("guid") or fallback_guid or "").strip()
+    if not guid:
+        return None
+    if track.get("guid") != guid:
+        track["guid"] = guid
+        repaired.add("guid")
+
+    title = str(track.get("title") or "").strip()
+    if not title:
+        title = "未知歌曲"
+        repaired.add("title")
+    track["title"] = title
+
+    raw_duration = track.get("duration")
+    try:
+        duration = int(float(raw_duration or 0))
+    except (TypeError, ValueError):
+        duration = 0
+        repaired.add("duration")
+    else:
+        if raw_duration in (None, ""):
+            repaired.add("duration")
+    track["duration"] = duration
+
+    artists, artists_repaired = _favorite_artist_objs(track.get("artists"), guid, ts)
+    if not artists:
+        artists = [{
+            "guid": f"{guid}:artist",
+            "name": "未知歌手",
+            "coverId": f"{guid}:artist",
+            "createdAt": ts,
+            "updatedAt": ts,
+        }]
+        artists_repaired = True
+    if artists_repaired:
+        repaired.add("artists")
+    track["artists"] = artists
+
+    album = track.get("album")
+    if not isinstance(album, dict):
+        album = {
+            "guid": f"{guid}:album",
+            "name": "未知专辑",
+            "coverId": guid,
+            "releaseDate": 0,
+            "barcode": "",
+            "createdAt": ts,
+            "updatedAt": ts,
+        }
+        repaired.add("album")
+    else:
+        album = dict(album)
+        if not str(album.get("name") or "").strip():
+            album["name"] = "未知专辑"
+            repaired.add("album")
+        if not str(album.get("guid") or "").strip():
+            album["guid"] = f"{guid}:album"
+            repaired.add("album")
+        if not str(album.get("coverId") or "").strip():
+            album["coverId"] = guid
+            repaired.add("album")
+        if not isinstance(album.get("artists"), list) or not album.get("artists"):
+            album["artists"] = artists
+            repaired.add("album")
+    track["album"] = album
+
+    if repaired:
+        logger.warning(
+            "[ONLINE_FAVORITES] 收藏条目自检补齐 guid=%s fields=%s",
+            guid, ",".join(sorted(repaired)),
+        )
+    return track
 
 
 def _resolve_online_favorite_user(user_key: str) -> str:
@@ -8317,9 +8466,15 @@ def _favorite_raw_track(item: Any) -> dict:
         raw["id"] = f"kugou:{track_hash}"
         raw["source"] = "kugou"
 
-    for src, dst in (("title", "title"), ("name", "title"), ("artist", "artist"),
-                     ("album", "album"), ("artists", "artists"),
-                     ("duration", "duration_s"), ("duration_s", "duration_s")):
+    for src, dst in (
+        ("title", "title"), ("name", "title"), ("artist", "artist"),
+        ("album", "album"), ("artists", "artists"),
+        ("SingerName", "SingerName"), ("singer_name", "singer_name"),
+        ("Singers", "Singers"), ("singers", "singers"),
+        ("singerinfo", "singerinfo"), ("singername", "singername"),
+        ("author_name", "author_name"), ("singer", "singer"),
+        ("duration", "duration_s"), ("duration_s", "duration_s"),
+    ):
         if not raw.get(dst) and item.get(src) not in (None, ""):
             raw[dst] = item.get(src)
     return raw
@@ -9183,14 +9338,24 @@ async def favorite_track_list(request: Request):
     online_tracks = []
     for it in fav_items_sorted:
         t = it.get("track")
-        if isinstance(t, dict):
-            # 确保关键属性为最新或格式完整
-            t["isFavorite"] = True
-            online_tracks.append(t)
-        else:
-            g = it.get("guid") or ""
-            if g:
-                online_tracks.append(build_favorite_track_obj(g, created_at=it.get("createdAt")))
+        g = _favorite_item_guid(it)
+        item_created_at = it.get("createdAt")
+        try:
+            if isinstance(t, dict):
+                candidate = t
+            elif g:
+                candidate = build_favorite_track_obj(g, created_at=item_created_at)
+            else:
+                logger.warning("[ONLINE_FAVORITES] 收藏条目缺少 guid，已跳过列表渲染")
+                continue
+            checked = _repair_online_favorite_track(candidate, fallback_guid=g, created_at=item_created_at)
+            if checked is None:
+                logger.warning("[ONLINE_FAVORITES] 收藏条目缺少 guid，已跳过列表渲染")
+                continue
+            checked["isFavorite"] = True
+            online_tracks.append(checked)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ONLINE_FAVORITES] 收藏条目自检失败 guid=%s err=%s", g, e)
 
     data["list"] = official_list + online_tracks
     data["total"] = official_total + len(online_tracks)
