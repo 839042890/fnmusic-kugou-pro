@@ -315,7 +315,7 @@ def test_s1_artist_fallbacks() -> None:
         assert vo.get("artists"), (field, vo)
         expected_name = extra[field] if field != "Singers" else extra[field][0]["name"]
         assert vo["artists"][0].get("name") == expected_name, (field, vo["artists"])
-        assert vo.get("album", {}).get("artists") == vo["artists"], (field, vo.get("album"))
+        assert "artists" not in vo.get("album", {}), (field, vo.get("album"))
 
     vo = app.build_online_track({
         "id": "kugou:noartist",
@@ -328,7 +328,58 @@ def test_s1_artist_fallbacks() -> None:
     fallback = vo["artists"][0]
     assert fallback.get("guid") == f"{vo['guid']}:artist", fallback
     assert fallback.get("name") == "未知歌手", fallback
-    assert vo.get("album", {}).get("artists") == vo["artists"], vo.get("album")
+    assert "artists" not in vo.get("album", {}), vo.get("album")
+
+
+def test_s1_online_track_release_date_types() -> None:
+    item = {
+        "id": "kugou:noalbummeta",
+        "source": "kugou",
+        "title": "无专辑信息",
+        "duration_s": 1000,
+        "artists": [{"name": "歌手", "id": "1"}],
+    }
+    vo = app.build_online_track(item)
+    album = vo.get("album")
+    assert isinstance(album, dict), album
+    assert isinstance(album.get("releaseDate"), str), type(album.get("releaseDate"))
+    assert album["releaseDate"] == "", album
+    assert vo.get("year") is None, vo.get("year")
+    assert "artists" not in album, album
+
+    dated = app.build_online_track({**item, "release_date": "1988-01-01"})
+    dated_album = dated.get("album")
+    assert isinstance(dated_album, dict), dated_album
+    assert isinstance(dated_album.get("releaseDate"), str), type(dated_album.get("releaseDate"))
+    assert dated_album["releaseDate"] == "1988-01-01", dated_album
+    assert dated.get("year") == 1988, dated.get("year")
+    assert "artists" not in dated_album, dated_album
+
+
+def test_s1_favorite_track_obj_release_date_types() -> None:
+    guid = "online:kugou:favtypes"
+    track = app.build_favorite_track_obj(
+        guid, {"title": "收藏无日期", "artist": "歌手", "album": "专辑"}, created_at=1,
+    )
+    album = track.get("album")
+    assert isinstance(album, dict), album
+    assert isinstance(album.get("releaseDate"), str), type(album.get("releaseDate"))
+    assert album["releaseDate"] == "", album
+    assert track.get("year") is None, track.get("year")
+    assert "artists" not in album, album
+
+    dated = app.build_favorite_track_obj(
+        guid,
+        {"title": "收藏有日期", "artist": "歌手", "album": "专辑",
+         "release_date": "1988-01-01"},
+        created_at=1,
+    )
+    dated_album = dated.get("album")
+    assert isinstance(dated_album, dict), dated_album
+    assert isinstance(dated_album.get("releaseDate"), str), type(dated_album.get("releaseDate"))
+    assert dated_album["releaseDate"] == "1988-01-01", dated_album
+    assert dated.get("year") == 1988, dated.get("year")
+    assert "artists" not in dated_album, dated_album
 
 
 def test_s1_import_keeps_singer_fields() -> None:
@@ -357,8 +408,78 @@ def test_s1_import_keeps_singer_fields() -> None:
             track = tracks.get(title)
             assert track is not None, (title, tracks)
             assert track.get("artists") and track["artists"][0].get("name") == name, (title, track)
-            assert track.get("album", {}).get("artists") == track["artists"], (title, track)
+            assert "artists" not in track.get("album", {}), (title, track)
     asyncio.run(inner())
+
+
+def test_s2_repair_legacy_release_date_types() -> None:
+    guid = "online:kugou:legacytypes"
+    legacy = {
+        "guid": guid,
+        "title": "旧类型收藏",
+        "duration": 123,
+        "year": 0,
+        "artists": [{
+            "guid": "online:kugou:artist:1", "name": "旧歌手",
+            "coverId": "online:kugou:artist:1", "createdAt": 1, "updatedAt": 1,
+        }],
+        "album": {
+            "guid": f"{guid}:album", "name": "旧专辑", "coverId": guid,
+            "releaseDate": 0, "barcode": "", "createdAt": 1, "updatedAt": 1,
+            "artists": [],
+        },
+    }
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    app.logger.addHandler(handler)
+    try:
+        checked = app._repair_online_favorite_track(legacy, created_at=1)
+    finally:
+        app.logger.removeHandler(handler)
+
+    assert checked is not None, checked
+    album = checked.get("album")
+    assert isinstance(album.get("releaseDate"), str), type(album.get("releaseDate"))
+    assert album["releaseDate"] == "", album
+    assert checked.get("year") is None, checked.get("year")
+    assert "artists" not in album, album
+    logs = stream.getvalue()
+    assert "WARNING" in logs and guid in logs, logs
+    for field in ("releaseDate", "year", "artists"):
+        assert field in logs, (field, logs)
+
+
+def test_s2_repair_benign_track_untouched() -> None:
+    guid = "online:kugou:benigntypes"
+    benign = {
+        "guid": guid,
+        "title": "良性收藏",
+        "duration": 456,
+        "year": 1988,
+        "artists": [{
+            "guid": "online:kugou:artist:7", "name": "健康歌手",
+            "coverId": "online:kugou:artist:7", "createdAt": 2, "updatedAt": 2,
+        }],
+        "album": {
+            "guid": f"{guid}:album", "name": "健康专辑", "coverId": guid,
+            "releaseDate": "1988-01-01", "barcode": "", "createdAt": 2, "updatedAt": 2,
+        },
+    }
+    before = json.loads(json.dumps(benign, ensure_ascii=False))
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    app.logger.addHandler(handler)
+    try:
+        checked = app._repair_online_favorite_track(benign, created_at=1)
+    finally:
+        app.logger.removeHandler(handler)
+
+    assert checked == before, checked
+    assert "WARNING" not in stream.getvalue(), stream.getvalue()
 
 
 def test_s2_import_dedupe_counts_and_sort() -> None:
@@ -542,8 +663,8 @@ def test_s2_list_sanitizes_dirty_online_track() -> None:
         healthy_artist = {"guid": "online:kugou:artist:7", "name": "健康歌手",
                           "coverId": "online:kugou:artist:7", "createdAt": 2, "updatedAt": 2}
         healthy_album = {"guid": f"{healthy_guid}:album", "name": "健康专辑",
-                         "artists": [healthy_artist], "coverId": healthy_guid,
-                         "releaseDate": 0, "barcode": "", "createdAt": 2, "updatedAt": 2}
+                         "coverId": healthy_guid, "releaseDate": "1988-01-01",
+                         "barcode": "", "createdAt": 2, "updatedAt": 2}
         write_items([{
             "guid": dirty_guid,
             "createdAt": 1,
@@ -561,6 +682,7 @@ def test_s2_list_sanitizes_dirty_online_track() -> None:
                 "guid": healthy_guid,
                 "title": "健康收藏",
                 "duration": 456,
+                "year": 1988,
                 "artists": [healthy_artist],
                 "album": healthy_album,
             },
@@ -738,6 +860,8 @@ for _name, _fn in [
     ("delete 认三种字段名且幂等", test_s1_delete_fields_and_idempotent),
     ("delete 本地 guid 原样透传", test_s1_delete_local_guid_forwarded),
     ("搜索/歌单歌手字段归一化与空歌手兜底", test_s1_artist_fallbacks),
+    ("在线曲目 releaseDate/year/album.artists 类型对齐", test_s1_online_track_release_date_types),
+    ("收藏构造 releaseDate/year/album.artists 类型对齐", test_s1_favorite_track_obj_release_date_types),
     ("导入链路保留搜索/歌单歌手字段", test_s1_import_keeps_singer_fields),
 ]:
     run_case(_name, _fn)
@@ -757,6 +881,8 @@ print("\nS5/S6 排序与容错")
 run_case("坏 JSON 隔离且收藏页 200", test_s6_corrupt_json_isolated_and_list_ok)
 run_case("写失败保留旧文件并清理临时文件", test_s6_save_keeps_old_file_on_failure)
 run_case("收藏列表脏数据补齐歌手与专辑", test_s2_list_sanitizes_dirty_online_track)
+run_case("旧收藏 releaseDate/year/album.artists 就地纠正", test_s2_repair_legacy_release_date_types)
+run_case("良性收藏字段不被改写", test_s2_repair_benign_track_untouched)
 run_case("收藏列表分页边界与跨页拼接", test_s1_list_pagination_boundaries)
 run_case("在线收藏补 favoriteAt、官方字段透传", test_s2_list_favorite_at)
 run_case("收藏列表诊断日志字段正确", test_s3_list_diagnostic_log)

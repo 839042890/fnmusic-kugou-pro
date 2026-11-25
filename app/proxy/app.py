@@ -2733,7 +2733,7 @@ def build_online_track(item: dict) -> dict:
     created_at = int(item.get("createdAt") or time.time())
     updated_at = int(item.get("updatedAt") or created_at)
     album_id = item.get("album_id") or ""
-    release_date = str(item.get("release_date") or "").strip() or None
+    release_date = str(item.get("release_date") or "").strip()
     year: int | None = None
     if release_date:
         try:
@@ -2799,7 +2799,6 @@ def build_online_track(item: dict) -> dict:
         "guid": f"online:kugou:album:{album_id}" if album_id not in ("", None) else album_guid,
         "name": album,
         "coverId": guid,
-        "artists": artists_list,
         "releaseDate": release_date,
         "barcode": None,
         "createdAt": created_at,
@@ -8260,13 +8259,18 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
             "updatedAt": ts,
         }]
 
-    album_name = (vo.get("album", {}).get("name") if isinstance(vo.get("album"), dict) else "") or ""
+    vo_album = vo.get("album") if isinstance(vo.get("album"), dict) else {}
+    album_name = vo_album.get("name") or ""
+    release_date = vo_album.get("releaseDate")
+    if not isinstance(release_date, str):
+        release_date = ""
+    vo_year = vo.get("year")
+    year = vo_year if isinstance(vo_year, int) else None
     album_obj = {
         "guid": f"{guid}:album",
         "name": album_name,
-        "artists": artists_list,
         "coverId": guid,
-        "releaseDate": 0,
+        "releaseDate": release_date,
         "barcode": "",
         "createdAt": ts,
         "updatedAt": ts,
@@ -8286,7 +8290,7 @@ def build_favorite_track_obj(guid: str, info: dict | None = None, created_at: in
         "audioSpec": audio_spec,
         "accessStatus": 0,
         "coverId": guid,
-        "year": 0,
+        "year": year,
         "discNo": 1,
         "trackNo": 1,
         "isrc": "",
@@ -8371,13 +8375,17 @@ def _repair_online_favorite_track(raw_track: Any, fallback_guid: str = "", creat
         repaired.add("artists")
     track["artists"] = artists
 
+    if track.get("year") == 0:
+        track["year"] = None
+        repaired.add("year")
+
     album = track.get("album")
     if not isinstance(album, dict):
         album = {
             "guid": f"{guid}:album",
             "name": "未知专辑",
             "coverId": guid,
-            "releaseDate": 0,
+            "releaseDate": "",
             "barcode": "",
             "createdAt": ts,
             "updatedAt": ts,
@@ -8394,9 +8402,12 @@ def _repair_online_favorite_track(raw_track: Any, fallback_guid: str = "", creat
         if not str(album.get("coverId") or "").strip():
             album["coverId"] = guid
             repaired.add("album")
-        if not isinstance(album.get("artists"), list) or not album.get("artists"):
-            album["artists"] = artists
-            repaired.add("album")
+        if not isinstance(album.get("releaseDate"), str):
+            album["releaseDate"] = ""
+            repaired.add("album.releaseDate")
+        if "artists" in album:
+            album.pop("artists", None)
+            repaired.add("album.artists")
     track["album"] = album
 
     if repaired:
