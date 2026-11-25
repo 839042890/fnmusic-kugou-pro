@@ -11,4 +11,4 @@ install_dep_apps      = trim.music:python312
 desktop_uidir         = ui
 desktop_applaunchname = fnmusic_kugou_pro.main
 changelog             = 1.3.4: 接管 track/metadata 修复红心状态（在线曲目 isFavorite 真实、本地曲目透传不变、异常兜底不报错）；本包为独立分叉，版本号独立计数
-checksum              = 3a0429a63ba985a2dda0469b61d412be
+checksum              = 5113135f131e0f049b7ed005d92c1364
