@@ -9,7 +9,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-fnOS%20x86-green.svg)]()
-![Version](https://img.shields.io/badge/version-1.0.8-orange.svg)
+![Version](https://img.shields.io/badge/version-1.3.4-orange.svg)
 
 ---
 
@@ -403,6 +403,14 @@ sudo FNMUSIC_ADOPT_WIZARD=1 appcenter-cli install-fpk fnmusic_kugou_pro-*.fpk
 
 | 版本 | 要点 |
 |---|---|
+| **1.3.4** | **红心状态修复**：接管 `track/metadata`，在线曲目 `isFavorite` 反映真实收藏，红心常亮、可取消收藏 |
+| **1.3.3** | **Android 收藏页空白修复**：`album.releaseDate` 必须为字符串、`year` 必须为 null、去掉 `album.artists` |
+| **1.3.2** | 收藏列表按 `page/size` 分页（默认 100、上限 200），`total` 给全量；补 `favoriteAt` |
+| **1.3.1** | 在线收藏 `artists` 为空导致整页空白：歌手字段归一化 + 返回前列表自检 |
+| **1.3.0** | **在线收藏本地化**：本地 JSON 落账（0 延迟）、歌单导入收藏（上限 1000、可按来源撤销）、坏 JSON 备份降级 |
+| **1.2.0** | 设置页拆成三个页签（连接与音源 / 存储与配置 / 歌单与扩展） |
+| **1.1.1** | 歌单勾选框修复（`:not(:disabled)` 与"全部置禁用"冲突） |
+| **1.1.0** | 歌单黑白名单 UI |
 | **1.0.8** | **搜索卡顿修复**：防抖（首次搜索等 0.8s 窗口，连打三字只发一次上游）+ 世代号（旧请求被新词取代即丢弃，不再覆盖新结果）+ 分级 TTL（空结果 10s / 未取满 30s / 完整 300s）+ 同源并发闸（同 (关键词,页码,页大小) 并发只发一次，翻页不错页）。只改后端搜索入口 |
 | **1.0.7** | **桥接器 5 秒卡顿（主因）**：转发响应过去无条件 `recv` 到 EOF，而 uvicorn keep-alive 默认 5 秒不关连接 ⇒ 每个 `/app/fnmusic_kugou_pro/*` 请求白等 5 秒。改为按 `Content-Length` 收满即回，`HEAD/204/304` 发完头即收尾，chunked/无长度仍走 EOF。实测 5.0s → <0.1s。**歌单排序**：真实歌单在前、27 个虚拟歌单在后（数量/命名/guid 前缀不变）。**P-10**：空 `kugou_url`（设置未加载完就点保存）不再误报 400，空值视为未修改；前端保存按钮同时置灰。**设置页**：`/_ext/settings` 由 2 次请求合并为 1 次（in-flight 去重），favicon 改 data-URI（0 请求） |
 | **1.0.6** | **P-07 登录态探活**：`/_ext/login/status` 每 10 分钟探一次上游（`/user/playlist`），失效返回 `token_invalid`，设置页显示「登录已失效，请重新扫码」并放出扫码按钮；探活失败按 unknown 处理，不误报失效。**P-08** 三处设置保存改用 POST（后端 `?save=1` 兼容分支保留）。**判据修正**：`status=0 + error_code=20017` 曾被判成成功（`status` 与 `error_code` 混读），6 个调用点一并收紧，失败回包仍返回空壳、只多出日志原值 |
