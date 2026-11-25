@@ -8093,6 +8093,8 @@ async def static_cover(request: Request, subpath: str = ""):
 
 _FAV_LOCK = asyncio.Lock()
 _FAV_IMPORT_LIMIT = 1000
+_FAV_LIST_PAGE_SIZE_DEFAULT = 100
+_FAV_LIST_PAGE_SIZE_MAX = 200
 _KUGOU_TRACK_GUID_PREFIX = "online:kugou:"
 
 
@@ -9271,9 +9273,23 @@ async def favorite_track_list(request: Request):
     if not _is_get_request(request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     upstream_client = get_upstream_client(request.app)
+
+    page = _read_int(request.query_params.get("page"), 1)
+    if page < 1:
+        page = 1
+    size = _read_int(request.query_params.get("size"), _FAV_LIST_PAGE_SIZE_DEFAULT)
+    if size < 1:
+        size = _FAV_LIST_PAGE_SIZE_DEFAULT
+    if size > _FAV_LIST_PAGE_SIZE_MAX:
+        size = _FAV_LIST_PAGE_SIZE_MAX
+
+    upstream_params = [
+        (k, v) for k, v in request.query_params.multi_items()
+        if k not in ("page", "size")
+    ]
     url_path = request.url.path
-    if request.url.query:
-        url_path = f"{url_path}?{request.url.query}"
+    if upstream_params:
+        url_path = f"{url_path}?{urlencode(upstream_params)}"
     headers = copy_incoming_headers(request)
 
     req = upstream_client.build_request("GET", url_path, headers=headers)
@@ -9353,12 +9369,24 @@ async def favorite_track_list(request: Request):
                 logger.warning("[ONLINE_FAVORITES] 收藏条目缺少 guid，已跳过列表渲染")
                 continue
             checked["isFavorite"] = True
+            favorite_at = _favorite_created_at(item_created_at) or _favorite_created_at(checked.get("createdAt"))
+            checked["createdAt"] = favorite_at
+            checked["favoriteAt"] = favorite_at
             online_tracks.append(checked)
         except Exception as e:  # noqa: BLE001
             logger.warning("[ONLINE_FAVORITES] 收藏条目自检失败 guid=%s err=%s", g, e)
 
-    data["list"] = official_list + online_tracks
-    data["total"] = official_total + len(online_tracks)
+    merged = official_list + online_tracks
+    total = official_total + len(online_tracks)
+    start = (page - 1) * size
+    data["list"] = merged[start:start + size]
+    data["total"] = total
+
+    logger.info(
+        "[ONLINE_FAVORITES] list user=%s official=%d online=%d page=%d size=%d out=%d total=%d",
+        sanitize_user_guid(user_guid)[:8], len(official_list), len(online_tracks),
+        page, size, len(data["list"]), total,
+    )
 
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 

@@ -1,5 +1,5 @@
 appname               = fnmusic_kugou_pro
-version               = 1.3.1
+version               = 1.3.2
 display_name          = 飞牛音乐酷狗增强
 desc                  = 为飞牛音乐接入自建 KuGouMusicApi 作为外部音源，支持搜索、在线播放、歌词、边播边存。零侵入 Unix Socket 接管架构，不修改飞牛官方 nginx、二进制或数据库。本包为独立分叉分支（fnmusic_kugou_pro），与上游 fnmusic_ext_kugou 不共存。
 maintainer            = 星痕在此
@@ -10,5 +10,5 @@ os_min_version        = 1.2.0
 install_dep_apps      = trim.music:python312
 desktop_uidir         = ui
 desktop_applaunchname = fnmusic_kugou_pro.main
-changelog             = 1.3.1: 修复在线收藏 artists 为空导致收藏页空白（歌手归一化+列表自检，旧数据自动修复）；导入上限 300→1000。本包为独立分叉，版本号独立计数。
-checksum              = 23e2ce61b00146f70c274c3fad879a39
+changelog             = 1.3.2: 收藏列表按 page/size 分页返回（默认100/上限200，total 全量），条目补 favoriteAt，新增合并诊断日志。本包为独立分叉，版本号独立计数。
+checksum              = 640f6a9e3a6f3880c47a349833b15707

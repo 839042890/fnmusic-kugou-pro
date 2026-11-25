@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""在线收藏落本地 + 歌单导入（v1.3.0）测试。
+"""在线收藏落本地 + 歌单导入 + 列表分页（v1.3.2）测试。
 
 覆盖：S1 三种字段名、S2 导入去重与上限、S3 只撤销来源、S5 createdAt 递增，
-以及 S6 坏 JSON 隔离与写盘后收藏页不白屏。
+以及 S6 坏 JSON 隔离、列表 page/size 切片、favoriteAt 与诊断日志。
 
 运行：TMPDIR=/dev/shm <venv-python> tests/test_online_favorites.py
 """
@@ -126,6 +126,9 @@ STATE = {
         "pid2": [raw_track("p2h", "另一张")],
     },
     "forward_calls": [],
+    "upstream_list": [{"guid": "native-1", "title": "本地收藏"}],
+    "upstream_total": 1,
+    "upstream_calls": [],
 }
 
 
@@ -167,10 +170,25 @@ class FakeUpstreamClient:
         return httpx.Request(method, "http://upstream" + url, headers=headers)
 
     async def send(self, req):
+        STATE["upstream_calls"].append(str(req.url))
+        full = list(STATE["upstream_list"])
+        params = req.url.params
+        items = full
+        if "page" in params or "size" in params:
+            try:
+                page = int(params.get("page") or 1)
+                size = int(params.get("size") or 100)
+            except (TypeError, ValueError):
+                page, size = 1, 100
+            start = max(0, (page - 1) * size)
+            items = full[start:start + size]
+        total = STATE.get("upstream_total")
+        if not isinstance(total, int):
+            total = len(full)
         return httpx.Response(200, json={
             "code": 0,
             "msg": "ok",
-            "data": {"list": [{"guid": "native-1", "title": "本地收藏"}], "total": 1},
+            "data": {"list": items, "total": total},
         })
 
 
@@ -190,10 +208,36 @@ async def request(method: str, path: str, **kw):
 def reset_state() -> None:
     clear_favorites()
     STATE["forward_calls"].clear()
+    STATE["upstream_calls"].clear()
+    STATE["upstream_list"] = [{"guid": "native-1", "title": "本地收藏"}]
+    STATE["upstream_total"] = 1
     STATE["tracks"] = {
         "pid1": [raw_track("DUPHASH", "重复"), raw_track("h2", "同名"), raw_track("h3", "同名"),
                  raw_track("h4", "四"), raw_track("h5", "五")],
         "pid2": [raw_track("p2h", "另一张")],
+    }
+
+
+def online_item(seq: int, title: str | None = None) -> dict:
+    guid = f"online:kugou:pagination-{seq}"
+    return {
+        "guid": guid,
+        "createdAt": seq,
+        "track": app.build_favorite_track_obj(
+            guid,
+            {"title": title or f"在线{seq}", "artist": "歌手", "album": "专辑"},
+            created_at=seq,
+        ),
+    }
+
+
+def native_item(seq: int) -> dict:
+    return {
+        "guid": f"native-{seq:03d}",
+        "title": f"官方{seq}",
+        "createdAt": seq,
+        "isFavorite": True,
+        "customField": f"keep-{seq}",
     }
 
 
@@ -549,6 +593,127 @@ def test_s2_list_sanitizes_dirty_online_track() -> None:
     asyncio.run(inner())
 
 
+def test_s1_list_pagination_boundaries() -> None:
+    async def inner():
+        reset_state()
+        official = [native_item(i) for i in range(1, 141)]
+        online = [online_item(i) for i in range(1, 289)]
+        online.reverse()
+        write_items(online)
+        STATE["upstream_list"] = official
+        STATE["upstream_total"] = len(official)
+
+        r = await request("GET", "/music/api/v1/favorite-track/list",
+                          params={"page": 1, "size": 100})
+        assert r.status_code == 200, r.text
+        data = r.json()["data"]
+        assert len(data["list"]) == 100, len(data["list"])
+        assert data["total"] == 428, data["total"]
+        assert data["list"] == official[:100], "官方条目必须原序透传"
+        assert not any("page=" in url or "size=" in url for url in STATE["upstream_calls"]), \
+            STATE["upstream_calls"]
+
+        rdefault = await request("GET", "/music/api/v1/favorite-track/list")
+        default_page = rdefault.json()["data"]
+        assert len(default_page["list"]) == 100, len(default_page["list"])
+        assert default_page["total"] == 428, default_page["total"]
+
+        r2 = await request("GET", "/music/api/v1/favorite-track/list",
+                           params={"page": 2, "size": 100})
+        page2 = r2.json()["data"]
+        assert len(page2["list"]) == 100, len(page2["list"])
+        assert page2["total"] == 428, page2["total"]
+        assert page2["list"][0]["guid"] == "native-101", page2["list"][0]
+        assert page2["list"][39]["guid"] == "native-140", page2["list"][39]
+        assert page2["list"][40]["guid"] == "online:kugou:pagination-288", page2["list"][40]
+        assert page2["list"][99]["guid"] == "online:kugou:pagination-229", page2["list"][99]
+        assert data["list"][99]["guid"] == "native-100", data["list"][99]
+        assert data["list"][-1]["guid"] != page2["list"][0]["guid"], "跨页不能重复"
+
+        r5 = await request("GET", "/music/api/v1/favorite-track/list",
+                           params={"page": 5, "size": 100})
+        page5 = r5.json()["data"]
+        assert len(page5["list"]) == 28, len(page5["list"])
+        assert page5["total"] == 428, page5["total"]
+        assert page5["list"][0]["guid"] == "online:kugou:pagination-28", page5["list"][0]
+        assert page5["list"][-1]["guid"] == "online:kugou:pagination-1", page5["list"][-1]
+
+        r99 = await request("GET", "/music/api/v1/favorite-track/list",
+                            params={"page": 99, "size": 100})
+        page99 = r99.json()["data"]
+        assert page99["list"] == [], page99["list"]
+        assert page99["total"] == 428, page99["total"]
+
+        r500 = await request("GET", "/music/api/v1/favorite-track/list",
+                             params={"page": 1, "size": 500})
+        page500 = r500.json()["data"]
+        assert len(page500["list"]) == 200, len(page500["list"])
+        assert page500["total"] == 428, page500["total"]
+
+        for params in ({"page": 0, "size": 0}, {"page": "bad", "size": "bad"}):
+            rbad = await request("GET", "/music/api/v1/favorite-track/list", params=params)
+            bad = rbad.json()["data"]
+            assert len(bad["list"]) == 100, (params, len(bad["list"]))
+            assert bad["total"] == 428, (params, bad["total"])
+    asyncio.run(inner())
+
+
+def test_s2_list_favorite_at() -> None:
+    async def inner():
+        reset_state()
+        official = native_item(1)
+        official["favoriteAt"] = 777
+        official_without = native_item(2)
+        official_without.pop("isFavorite")
+        STATE["upstream_list"] = [official, official_without]
+        STATE["upstream_total"] = 2
+        item = online_item(12345)
+        item["track"]["createdAt"] = 1
+        item["track"]["updatedAt"] = 1
+        write_items([item])
+
+        r = await request("GET", "/music/api/v1/favorite-track/list",
+                          params={"page": 1, "size": 100})
+        assert r.status_code == 200, r.text
+        rows = r.json()["data"]["list"]
+        assert rows[0] == official, rows[0]
+        assert rows[0]["favoriteAt"] == 777, rows[0]
+        assert rows[1]["guid"] == official_without["guid"], rows[1]
+        assert "favoriteAt" not in rows[1], rows[1]
+        assert rows[2]["favoriteAt"] == 12345, rows[2]
+        assert rows[2]["favoriteAt"] == rows[2]["createdAt"], rows[2]
+    asyncio.run(inner())
+
+
+def test_s3_list_diagnostic_log() -> None:
+    async def inner():
+        reset_state()
+        official = [native_item(i) for i in range(1, 141)]
+        online = [online_item(i) for i in range(1, 289)]
+        online.reverse()
+        write_items(online)
+        STATE["upstream_list"] = official
+        STATE["upstream_total"] = len(official)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        app.logger.addHandler(handler)
+        try:
+            r = await request("GET", "/music/api/v1/favorite-track/list",
+                              params={"page": 1, "size": 100})
+        finally:
+            app.logger.removeHandler(handler)
+
+        assert r.status_code == 200, r.text
+        logs = stream.getvalue()
+        pattern = (r"INFO \[ONLINE_FAVORITES\] list user=aaaaaaaa official=140 "
+                   r"online=288 page=1 size=100 out=100 total=428")
+        assert re.search(pattern, logs), logs
+    asyncio.run(inner())
+
+
 def test_s4_settings_controls_static() -> None:
     html = (PKG / "app" / "web" / "settings.html").read_text(encoding="utf-8")
     for token in ("导入歌单到用户收藏", "btn-online-fav-import", "btn-online-fav-undo",
@@ -592,6 +757,9 @@ print("\nS5/S6 排序与容错")
 run_case("坏 JSON 隔离且收藏页 200", test_s6_corrupt_json_isolated_and_list_ok)
 run_case("写失败保留旧文件并清理临时文件", test_s6_save_keeps_old_file_on_failure)
 run_case("收藏列表脏数据补齐歌手与专辑", test_s2_list_sanitizes_dirty_online_track)
+run_case("收藏列表分页边界与跨页拼接", test_s1_list_pagination_boundaries)
+run_case("在线收藏补 favoriteAt、官方字段透传", test_s2_list_favorite_at)
+run_case("收藏列表诊断日志字段正确", test_s3_list_diagnostic_log)
 run_case("设置页导入控件存在且无外部资源", test_s4_settings_controls_static)
 
 print("\n结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))
