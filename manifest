@@ -11,4 +11,4 @@ install_dep_apps      = trim.music:python312
 desktop_uidir         = ui
 desktop_applaunchname = fnmusic_kugou_pro.main
 changelog             = 1.3.2: 收藏列表按 page/size 分页返回（默认100/上限200，total 全量），条目补 favoriteAt，新增合并诊断日志。本包为独立分叉，版本号独立计数。
-checksum              = 640f6a9e3a6f3880c47a349833b15707
+checksum              = 4394ea3e47080dc48118352af262204b
