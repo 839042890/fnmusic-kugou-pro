@@ -7913,25 +7913,16 @@ async def track_metadata(request: Request, subpath: str = ""):
     if not _is_get_request(request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
-    if not is_online_guid(guid):
+    if not str(guid or "").startswith(_KUGOU_TRACK_GUID_PREFIX):
         # 本地曲目：透传后补 data.track.coverId（优先官方 coverId，未换到则用 guid）。
         # 上传与回写由 static_cover 在拿到封面 bytes 时触发，此处不重复回源。
         return await forward_upstream_with_local_lyric_fallback(
             request, get_upstream_client(request.app), local_cover_guid=guid
         )
 
-    data = await _online_info(request, guid) or stub_online_info(guid)
-    cached_lyric = read_lyric_cache(guid)
-    if cached_lyric:
-        data = {**data, "lyric": cached_lyric}
-    elif data.get("lyric"):
-        write_lyric_cache(
-            guid,
-            str(data.get("lyric") or ""),
-            title=str(data.get("title") or ""),
-            artist=str(data.get("artist") or ""),
-        )
-    return JSONResponse(content=build_metadata_payload(guid, data))
+    return await _online_track_metadata_response(
+        request, get_upstream_client(request.app), guid
+    )
 
 
 @app.get("/music/api/v1/search/playlist")
@@ -8416,6 +8407,127 @@ def _repair_online_favorite_track(raw_track: Any, fallback_guid: str = "", creat
             guid, ",".join(sorted(repaired)),
         )
     return track
+
+
+def _find_online_favorite_item(items: list[dict], guid: str) -> dict | None:
+    """按 guid 精确匹配收藏条目；大小写不敏感，不做任何跨用户缓存。"""
+    target = str(guid or "").strip().lower()
+    if not target:
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_guid = _favorite_item_guid(item)
+        if item_guid and item_guid.strip().lower() == target:
+            return item
+    return None
+
+
+def _metadata_fallback_track(guid: str) -> dict:
+    """metadata 兜底 track：字段齐全、可渲染，但明确标记未收藏。"""
+    now = int(time.time())
+    artist_guid = f"{guid}:artist"
+    album_guid = f"{guid}:album"
+    return {
+        "guid": guid,
+        "title": "未知歌曲",
+        "duration": 0,
+        "isFavorite": False,
+        "isCue": False,
+        "genres": [],
+        "artists": [{
+            "guid": artist_guid,
+            "name": "未知歌手",
+            "coverId": artist_guid,
+            "createdAt": now,
+            "updatedAt": now,
+        }],
+        "album": {
+            "guid": album_guid,
+            "name": "未知专辑",
+            "coverId": guid,
+            "releaseDate": "",
+            "barcode": "",
+            "createdAt": now,
+            "updatedAt": now,
+        },
+        "audioSpec": {},
+        "accessStatus": 0,
+        "coverId": guid,
+        "year": None,
+        "discNo": 1,
+        "trackNo": 1,
+        "isrc": "",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+
+
+def _metadata_track_from_favorite(item: dict, guid: str) -> dict:
+    """收藏条目 -> 已修复的 track；命中时 isFavorite 恒为 true。"""
+    item_guid = _favorite_item_guid(item) or guid
+    created_at = item.get("createdAt")
+    raw_track = item.get("track")
+    track = None
+    if isinstance(raw_track, dict):
+        track = _repair_online_favorite_track(
+            raw_track, fallback_guid=item_guid, created_at=created_at
+        )
+    if track is None:
+        track = _repair_online_favorite_track(
+            {"guid": item_guid}, fallback_guid=item_guid, created_at=created_at
+        )
+    if track is None:
+        track = _metadata_fallback_track(item_guid)
+    track["isFavorite"] = True
+    return track
+
+
+async def _online_track_metadata_response(
+    request: Request, client: httpx.AsyncClient, guid: str
+) -> Response:
+    """在线 track metadata：收藏命中返回真实 isFavorite，任何异常走兜底。"""
+    try:
+        is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+
+        items = load_online_favorites(user_guid)
+        item = _find_online_favorite_item(items, guid)
+        if item is not None:
+            track = _metadata_track_from_favorite(item, guid)
+            hit = 1
+        else:
+            info = await _online_info(request, guid)
+            if not info:
+                raise RuntimeError("online metadata unavailable")
+            track = build_favorite_track_obj(guid, info)
+            track["isFavorite"] = False
+            hit = 0
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[ONLINE_FAVORITES] metadata fallback g=%s err=%s: %s",
+            guid, type(e).__name__, e,
+        )
+        return JSONResponse(content={
+            "code": 0,
+            "msg": "",
+            "data": {"track": _metadata_fallback_track(guid), "audioSpec": {}},
+        })
+
+    audio_spec = track.get("audioSpec")
+    if not isinstance(audio_spec, dict):
+        audio_spec = {}
+    track["audioSpec"] = audio_spec
+    logger.info(
+        "[ONLINE_FAVORITES] metadata user=%s g=%s hit=%d",
+        sanitize_user_guid(user_guid)[:8], _favorite_track_hash(guid)[:8], hit,
+    )
+    return JSONResponse(content={
+        "code": 0,
+        "msg": "",
+        "data": {"track": track, "audioSpec": audio_spec},
+    })
 
 
 def _resolve_online_favorite_user(user_key: str) -> str:

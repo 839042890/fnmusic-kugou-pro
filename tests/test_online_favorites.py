@@ -852,6 +852,176 @@ def test_s4_settings_controls_static() -> None:
     assert not re.search(r"(?:href|src)\s*=\s*['\"](?:https?:)?//", html, re.I), "新增了外部地址"
 
 
+def _metadata_favorite_item(guid: str, title: str, created_at: int = 1234) -> dict:
+    track = app.build_favorite_track_obj(
+        guid,
+        {"title": title, "artist": "收藏歌手", "album": "收藏专辑", "duration_s": 180000},
+        created_at=created_at,
+    )
+    track["isFavorite"] = False
+    return {"guid": guid, "createdAt": created_at, "track": track}
+
+
+def test_metadata_online_hit_is_favorite() -> None:
+    async def inner():
+        reset_state()
+        stored_guid = "online:kugou:metahitabcd1234"
+        request_guid = "online:kugou:MetaHitAbCd1234"
+        write_items([_metadata_favorite_item(stored_guid, "收藏命中歌")])
+
+        r = await request("GET", "/music/api/v1/track/metadata",
+                          params={"guid": request_guid, "lan": "zh-CN"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("code") == 0, body
+        data = body.get("data") or {}
+        track = data.get("track") or {}
+        assert track.get("isFavorite") is True, track
+        assert str(track.get("guid") or "").lower() == request_guid.lower(), track
+        assert track.get("title") == "收藏命中歌", track
+        assert track.get("duration") == 180000, track
+        assert track["artists"][0]["name"] == "收藏歌手", track
+        assert track["album"]["name"] == "收藏专辑", track
+        assert data.get("audioSpec") == track.get("audioSpec"), data
+    asyncio.run(inner())
+
+
+def test_metadata_online_miss_not_favorite() -> None:
+    async def inner():
+        reset_state()
+        guid = "online:kugou:metamiss9876"
+
+        r = await request("GET", "/music/api/v1/track/metadata",
+                          params={"guid": guid, "lan": "zh-CN"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("code") == 0, body
+        assert body.get("code") != 100002, body
+        data = body.get("data") or {}
+        track = data.get("track") or {}
+        assert track.get("isFavorite") is False, track
+        assert track.get("guid") == guid, track
+        assert track.get("title") == "在线歌", track
+        assert track.get("artists") and track["artists"][0]["name"] == "歌手", track
+        assert track.get("album", {}).get("name") == "专辑", track
+        assert data.get("audioSpec") == track.get("audioSpec"), data
+    asyncio.run(inner())
+
+
+def test_metadata_local_guid_forwarded() -> None:
+    async def inner():
+        reset_state()
+        local_guid = "0123456789abcdef0123456789abcdef"
+        upstream_body = {
+            "code": 0,
+            "msg": "",
+            "data": {
+                "audioSpec": {"codec": "flac", "duration": 1000},
+                "track": {
+                    "guid": local_guid,
+                    "title": "本地曲目",
+                    "hasLyric": True,
+                    "coverId": local_guid,
+                    "isFavorite": True,
+                },
+            },
+        }
+
+        async def fake_fetch(_request, _client):
+            return json.loads(json.dumps(upstream_body))
+
+        old_fetch = app.fetch_upstream_envelope
+        app.fetch_upstream_envelope = fake_fetch
+        try:
+            r = await request("GET", "/music/api/v1/track/metadata",
+                              params={"guid": local_guid, "lan": "zh-CN"})
+        finally:
+            app.fetch_upstream_envelope = old_fetch
+
+        assert r.status_code == 200, r.text
+        assert r.json() == upstream_body, (r.json(), upstream_body)
+    asyncio.run(inner())
+
+
+def test_metadata_cross_user_isolated() -> None:
+    async def inner():
+        reset_state()
+        guid = "online:kugou:meta-isolation-1"
+        write_items([_metadata_favorite_item(guid, "A 的收藏")], GUID_A)
+
+        r_a = await request("GET", "/music/api/v1/track/metadata", params={"guid": guid})
+        assert r_a.status_code == 200, r_a.text
+        assert r_a.json()["data"]["track"]["isFavorite"] is True, r_a.text
+
+        async def probe_user_b(_request, _client):
+            return True, GUID_B, None
+
+        old_probe = app._probe_upstream_auth
+        app._probe_upstream_auth = probe_user_b
+        try:
+            r_b = await request("GET", "/music/api/v1/track/metadata", params={"guid": guid})
+        finally:
+            app._probe_upstream_auth = old_probe
+
+        assert r_b.status_code == 200, r_b.text
+        body_b = r_b.json()
+        assert body_b.get("code") == 0, body_b
+        assert body_b["data"]["track"]["isFavorite"] is False, body_b
+    asyncio.run(inner())
+
+
+def test_metadata_field_contract() -> None:
+    async def inner():
+        reset_state()
+        guid = "online:kugou:metadata-contract"
+        item = _metadata_favorite_item(guid, "契约歌")
+        item["track"]["year"] = 0
+        item["track"]["album"]["releaseDate"] = 2020
+        item["track"]["album"]["artists"] = [{"name": "不应出现"}]
+        write_items([item])
+
+        r = await request("GET", "/music/api/v1/track/metadata", params={"guid": guid})
+        assert r.status_code == 200, r.text
+        track = r.json()["data"]["track"]
+        album = track.get("album") or {}
+        assert isinstance(album.get("releaseDate"), str), album
+        assert track.get("year") is None, track
+        assert "artists" not in album, album
+    asyncio.run(inner())
+
+
+def test_metadata_exception_fallback() -> None:
+    async def inner():
+        reset_state()
+        guid = "online:kugou:metadata-boom"
+
+        async def boom(_request, _guid):
+            raise RuntimeError("upstream down")
+
+        old_info = app._online_info
+        app._online_info = boom
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        app.logger.addHandler(handler)
+        try:
+            r = await request("GET", "/music/api/v1/track/metadata", params={"guid": guid})
+        finally:
+            app.logger.removeHandler(handler)
+            app._online_info = old_info
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body.get("code") == 0, body
+        data = body.get("data") or {}
+        assert data.get("audioSpec") == {}, data
+        assert data.get("track", {}).get("isFavorite") is False, data
+        logs = stream.getvalue()
+        assert "WARNING" in logs and guid in logs and "RuntimeError" in logs, logs
+    asyncio.run(inner())
+
+
 print("=" * 72)
 print("S1 收藏字段名与删除分支")
 for _name, _fn in [
@@ -887,6 +1057,14 @@ run_case("收藏列表分页边界与跨页拼接", test_s1_list_pagination_boun
 run_case("在线收藏补 favoriteAt、官方字段透传", test_s2_list_favorite_at)
 run_case("收藏列表诊断日志字段正确", test_s3_list_diagnostic_log)
 run_case("设置页导入控件存在且无外部资源", test_s4_settings_controls_static)
+
+print("\nS7 track/metadata 在线收藏")
+run_case("在线命中 isFavorite=true", test_metadata_online_hit_is_favorite)
+run_case("在线未命中 isFavorite=false 且非 100002", test_metadata_online_miss_not_favorite)
+run_case("本地 guid 原样透传", test_metadata_local_guid_forwarded)
+run_case("跨用户收藏隔离", test_metadata_cross_user_isolated)
+run_case("releaseDate/year/album.artists 字段契约", test_metadata_field_contract)
+run_case("上游异常兜底不 500 且记 WARNING", test_metadata_exception_fallback)
 
 print("\n结果：%d 通过 / %d 失败" % (len(PASS), len(FAIL)))
 for _name in FAIL:
